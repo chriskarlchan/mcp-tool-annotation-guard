@@ -30,8 +30,10 @@ Built with the [Policy Development Kit (PDK)](https://docs.mulesoft.com/pdk/late
 | Document | Contents |
 |---|---|
 | [docs/overview.md](docs/overview.md) | What the policy does, key features, limitations |
-| [docs/configuration.md](docs/configuration.md) | Every property, identity providers, deployment prerequisites, recommended policy order, refusals, logs |
+| [docs/configuration.md](docs/configuration.md) | Every property, identity providers, refusals, logs |
 | [docs/examples.md](docs/examples.md) | Configurations A–H with the tools each caller sees |
+| [docs/security.md](docs/security.md) | What it protects against and what not, trust model, fail-closed behaviour, logging, hardening checklist |
+| [docs/deployment.md](docs/deployment.md) | Deployment prerequisites, recommended policy order |
 | [docs/faq.md](docs/faq.md) | Common questions, related policies and specs |
 | [CHANGELOG.md](CHANGELOG.md) | Release notes |
 | [SECURITY.md](SECURITY.md) | How to report a vulnerability |
