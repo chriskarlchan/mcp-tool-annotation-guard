@@ -6,11 +6,11 @@ Please don't report security problems in public issues.
 
 Report them privately through GitHub instead: on this repository's **Security** tab, choose **Report a vulnerability**. Include the policy version, the Omni Gateway version, the configuration involved (with any secrets removed), and the steps to reproduce.
 
-You'll get an acknowledgement, and the fix and its release are coordinated with you before any details are made public.
+This is a community project maintained on a best-effort basis. Reports are reviewed as time allows. There's no guaranteed response time or fix, and the policy is provided "as is" under the Apache 2.0 licence.
 
 ## Supported versions
 
-Security fixes go into the latest release.
+Only the latest release is considered. Earlier versions don't get backported fixes.
 
 ## Scope
 
