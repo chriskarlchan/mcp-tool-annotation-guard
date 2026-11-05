@@ -1,0 +1,51 @@
+# Copyright 2026 Salesforce, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "mcp_tool_annotation_guard"
+version = "1.0.0"
+rust-version = "1.88.0"
+edition = "2018"
+resolver = "2"
+description = "MCP Tool Annotation Guard policy for MuleSoft Omni Gateway"
+license = "Apache-2.0"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[package.metadata.anypoint]
+group_id = "98acbdb3-4e1e-40b3-a8eb-f451a67a154b"
+definition_asset_id = "mcp-tool-annotation-guard"
+implementation_asset_id = "mcp-tool-annotation-guard-flex"
+
+# Minimum Omni Gateway runtime: stop iteration needs >= 1.11.4.
+[package.metadata.flex]
+min-version = "1.11.4"
+
+[dependencies]
+pdk = { version = "1.10.0", features = ["enable_stop_iteration"] }
+guard-core = { path = "guard-core" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
+anyhow = "1.0"
+
+[dev-dependencies]
+pdk-test = { version = "1.10.0" }
+# Same feature as `pdk`, so the unit-test host buffers bodies like the gateway does.
+pdk-unit = { version = "1.10.0", features = ["enable_stop_iteration"] }
+httpmock = "0.6"
+reqwest = "0.11"
+# Test-time JWT encoding for tests/identity_providers.rs (tokens are signed with the openssl CLI).
+base64 = "0.22"
+tokio = { version = "1", features = ["time"] }
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+# For a manual check only: traps the Wasm VM on the `x-guard-test-trap` request
+# header. Never enable it for `make build`, `make publish` or `make release`.
+test-trap = []
+
+[profile.release]
+lto = true
+opt-level = 'z'
+strip = "debuginfo"

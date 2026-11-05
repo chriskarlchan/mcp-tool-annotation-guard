@@ -1,0 +1,321 @@
+# Copyright 2026 Salesforce, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+---
+apiVersion: gateway.mulesoft.com/v1alpha1
+kind: Extension
+metadata:
+  labels:
+    title: MCP Tool Annotation Guard
+    category: Security
+    description: >-
+      Filters MCP tools/list and blocks tools/call by tool annotation class and
+      caller access level
+    metadata/interfaceScope: api,resource
+    metadata/capabilities/assetTypes: mcp
+spec:
+  extends:
+    - name: extension-definition
+      namespace: default
+  # Every property is optional; the policy applies its built-in
+  # defaults to anything left unset, so `default` here only pre-fills the UI.
+  # Rules from the pdk-schema-definition skill: no `@visibleOn` on DataWeave
+  # properties, and no DataWeave inside array items (both fail at deploy time).
+  #
+  # Form order: the settings most configurations need come first (mode, who
+  # gets which level, tools to block or reclassify), then settings for servers
+  # without annotations, then the advanced groups.
+  properties:
+    mode:
+      type: string
+      title: Mode
+      description: >-
+        Enforce refuses calls and hides tools. Audit only logs what it would
+        have refused (would_deny), so you can try a configuration safely.
+      enum:
+        - enforce
+        - audit
+      default: enforce
+    defaultLevel:
+      type: string
+      title: Default access level
+      description: >-
+        Level every caller starts at. read: read-only tools. write: also tools
+        that change data. destructive: all tools. none: no tools. Grants can
+        raise it.
+      enum:
+        - none
+        - read
+        - write
+        - destructive
+      default: read
+    callerAttributes:
+      type: string
+      format: dataweave
+      title: Caller roles or scopes
+      description: >-
+        Where the caller's roles, scopes or client ID come from, verified by an
+        earlier authentication policy. For JWT roles:
+        #[authentication.properties.claims.roles]. Needed only if you use grants.
+      bindings:
+        attributes: true
+        authentication: true
+    callerAttributeSeparator:
+      type: string
+      title: Separator for a single-string claim
+      description: >-
+        Set when the claim is one string holding several values, for example a
+        space for an OAuth scope claim. If left empty, the string is one value.
+    grants:
+      type: array
+      title: Grants (role to access level)
+      description: >-
+        Give callers with a role, scope or client ID a higher level. A caller
+        gets the highest level of all the grants they match.
+      items:
+        type: object
+        properties:
+          attribute:
+            type: string
+            title: Role, scope or client ID
+            description: Exact value, case-sensitive, for example mcp.admin.
+          level:
+            type: string
+            title: Access level
+            enum:
+              - read
+              - write
+              - destructive
+        required:
+          - attribute
+          - level
+      default: []
+    blockedTools:
+      type: array
+      title: Blocked tools
+      description: >-
+        Tool names no caller may use, whatever their level. Always hidden.
+      items:
+        type: string
+      default: []
+    toolOverrides:
+      type: array
+      title: Tool class overrides
+      description: >-
+        Set the class of a named tool yourself, when you don't trust or agree
+        with its annotations. Wins over annotations and name rules.
+      items:
+        type: object
+        properties:
+          name:
+            type: string
+            title: Tool name
+          class:
+            type: string
+            title: Class
+            enum:
+              - read
+              - write
+              - destructive
+        required:
+          - name
+          - class
+      default: []
+    unannotatedAs:
+      type: string
+      title: Class for tools without annotations
+      description: >-
+        Used for tools that declare no annotations and match no name rule.
+        With destructive (safest), only callers with the destructive level can
+        use them.
+      enum:
+        - read
+        - write
+        - destructive
+      default: destructive
+    nameRules:
+      type: array
+      title: Name rules for tools without annotations
+      description: >-
+        Classify tools that declare no annotations by name, for example ^get_
+        as read. Tried in order; the first matching regular expression wins.
+        Never overrides real annotations.
+      items:
+        type: object
+        properties:
+          pattern:
+            type: string
+            title: Name pattern (regular expression)
+            description: Anchor with ^, for example ^get_ or ^(list|search)_.
+          class:
+            type: string
+            title: Class
+            enum:
+              - read
+              - write
+              - destructive
+        required:
+          - pattern
+          - class
+      default: []
+    onUnknownTool:
+      type: string
+      title: Calls to tools not seen in a list
+      description: >-
+        deny refuses them and tells the agent to list tools again (safest).
+        classifyByName classes them by name rules, else as tools without
+        annotations.
+      enum:
+        - deny
+        - classifyByName
+      default: deny
+    filterToolsList:
+      type: boolean
+      title: Hide tools the caller can't use
+      description: >-
+        On: callers only see tools they may call. Off: callers see every tool,
+        but calls are still checked.
+      default: true
+    strictContradictions:
+      type: boolean
+      title: Treat contradictory annotations as destructive
+      description: >-
+        For a tool marked both read-only and destructive. Off follows the MCP
+        rule (read-only wins).
+      default: false
+    logging:
+      type: object
+      title: Logging
+      description: Extra log events. Refusals are always logged.
+      properties:
+        logAllowedCalls:
+          type: boolean
+          title: Log allowed calls
+          description: Log a debug event for every allowed tools/call.
+          default: false
+        logCallerAttributes:
+          type: boolean
+          title: Include caller roles in log events
+          description: >-
+            Adds the caller's roles or scopes to call events. Tokens are never
+            logged.
+          default: false
+    catalogPartition:
+      type: string
+      format: dataweave
+      title: "Advanced: tool catalog per tenant"
+      description: >-
+        Only for servers that show different tools to different tenants or
+        users. An expression for the value that separates them, for example a
+        tenant ID. If set but empty for a request, calls are refused.
+      bindings:
+        attributes: true
+        authentication: true
+    denial:
+      type: object
+      title: "Advanced: refusal format"
+      description: >-
+        How refused calls are answered. The defaults match Omni Gateway's own
+        MCP access-control refusals; keep them unless your client needs
+        something else.
+      properties:
+        style:
+          type: string
+          title: Refusal style
+          description: >-
+            jsonRpcError returns a JSON-RPC error. toolResultError returns a
+            tool result marked as an error, which more clients show to the
+            model.
+          enum:
+            - jsonRpcError
+            - toolResultError
+          default: jsonRpcError
+        errorCode:
+          type: integer
+          title: JSON-RPC error code
+          description: >-
+            Must be in -32099 to -32000 or outside the reserved range -32768 to
+            -32000.
+          default: -32008
+        httpStatus:
+          type: string
+          title: HTTP status
+          description: >-
+            Some clients never show a non-2xx answer to the model, so 200 is
+            safest.
+          enum:
+            - "200"
+            - "403"
+          default: "200"
+        includeRequiredLevel:
+          type: boolean
+          title: Say which level is required
+          description: Name the required level in refusal messages.
+          default: true
+        revealGrantNames:
+          type: boolean
+          title: Say which roles would grant access
+          description: >-
+            Name the roles or scopes that would allow the call. May reveal role
+            names.
+          default: false
+        hint:
+          type: string
+          title: Extra text for refusals
+          description: >-
+            Added to every refusal message, up to 512 characters, for example
+            "Ask #platform-team for access."
+    catalog:
+      type: object
+      title: "Advanced: tool catalog expiry"
+      description: How long the guard trusts the tool list it last saw.
+      properties:
+        maxAgeSeconds:
+          type: integer
+          title: Maximum catalog age (seconds)
+          description: >-
+            After this time, calls are refused until the agent lists tools
+            again. Most clients list once per session, so leave at 0 (off).
+          default: 0
+    limits:
+      type: object
+      title: "Advanced: size limits"
+      description: >-
+        Leave as is unless your server has very large tool lists or requests.
+        Body limits must not exceed the gateway's buffer limit (1 MB by
+        default).
+      properties:
+        maxRequestBodyBytes:
+          type: integer
+          title: Maximum request body (bytes)
+          description: Larger requests are refused.
+          default: 1048576
+        maxListResponseBytes:
+          type: integer
+          title: Maximum tool list response (bytes)
+          description: >-
+            Larger lists pass unfiltered and calls are refused until a list
+            fits.
+          default: 1048576
+        maxToolNameBytes:
+          type: integer
+          title: Maximum tool name (bytes)
+          default: 256
+        maxBatchSize:
+          type: integer
+          title: Maximum JSON-RPC batch size
+          default: 32
+        maxCachedTools:
+          type: integer
+          title: Maximum tools remembered per catalog
+          description: When full, new tools are refused.
+          default: 5000
+        maxCatalogBytes:
+          type: integer
+          title: Maximum catalog size (bytes)
+          description: When full, new tools are refused.
+          default: 524288
+        maxCatalogs:
+          type: integer
+          title: Maximum catalogs kept
+          description: One per API instance, configuration and partition.
+          default: 1000

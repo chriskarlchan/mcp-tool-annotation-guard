@@ -1,0 +1,22 @@
+# Copyright 2026 Salesforce, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+version: "3.3"
+
+services:
+  local-flex:
+    image: ${PDK_TEST_FLEX_IMAGE_NAME:-mulesoft/flex-gateway}:${PDK_TEST_FLEX_IMAGE_VERSION:-1.13.0}
+    ports:
+      - 8081:8081
+    volumes:
+      - ./config:/usr/local/share/mulesoft/flex-gateway/conf.d/
+  # Mock MCP server. Port 8080 is published so the
+  # diagnostic endpoints (/__wire, /__calls, /__reset) are reachable from the host.
+  backend:
+    image: node:24-alpine
+    command: ["node", "/app/server.mjs"]
+    environment:
+      - PORT=8080
+    ports:
+      - 8080:8080
+    volumes:
+      - ../mock-mcp-server:/app:ro

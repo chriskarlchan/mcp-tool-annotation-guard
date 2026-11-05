@@ -1,0 +1,22 @@
+# Copyright 2026 Salesforce, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "guard-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88.0"
+license = "Apache-2.0"
+description = "Pure-Rust decision logic for the MCP Tool Annotation Guard policy (no PDK dependencies)"
+publish = false
+
+[dependencies]
+# `raw_value` keeps request IDs and untouched subtrees as exact JSON text.
+# `arbitrary_precision` is deliberately not enabled:
+# Cargo would turn it on for the PDK's serde_json too and change its numbers.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["raw_value"] }
+# `nameRules` patterns use Rust `regex` syntax; matching is
+# linear-time, so no pattern can cause catastrophic backtracking.
+regex = "1"
+# SHA-256 for the partition key and the classification fingerprint.
+sha2 = "0.10"

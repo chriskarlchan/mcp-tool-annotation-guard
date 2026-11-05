@@ -1,0 +1,89 @@
+# Copyright 2026 Salesforce, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# All unit and integration tests run in CI.
+# No secrets: every crate is on crates.io, the Omni Gateway test image is
+# public, and `make test` creates its own disconnected registration.
+# No untrusted event data is used in any `run:` step.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Actions are pinned to full commit hashes; Dependabot keeps them current.
+jobs:
+  format:
+    name: Formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          toolchain: stable
+          components: rustfmt
+      - run: cargo fmt --check
+      - run: cargo fmt --check
+        working-directory: guard-core
+
+  guard-core:
+    name: guard-core unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: guard-core
+      - run: cargo test
+        working-directory: guard-core
+
+  policy:
+    name: PDK build, unit and integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          toolchain: stable
+          targets: wasm32-wasip1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: Install Anypoint CLI v4 and the PDK plugin
+        run: |
+          npm install -g anypoint-cli-v4
+          anypoint-cli-v4 plugins:install anypoint-pdk-plugin
+          anypoint-cli-v4 plugins | grep anypoint-pdk-plugin
+      - name: Install cargo-anypoint
+        run: make install-cargo-anypoint
+      # The gateway container writes registration.yaml into tests/config, and
+      # it runs as a different user from the runner, which owns the checkout.
+      - name: Let the gateway container write its registration
+        run: chmod a+w tests/config
+      - name: make test
+        run: make test
+      - name: Check the release build contains no test-trap code
+        run: |
+          if grep -a -q x-guard-test-trap target/wasm32-wasip1/release/*.wasm; then
+            echo "test-trap code found in the release Wasm" >&2
+            exit 1
+          fi
