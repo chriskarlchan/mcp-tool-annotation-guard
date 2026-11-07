@@ -124,12 +124,12 @@ Rules are tried in order; the first match wins.
 | Property | In the form | Type | Default | Description |
 |---|---|---|---|---|
 | `maxRequestBodyBytes` | Maximum request body (bytes) | integer ≥ 1024 | `1048576` | Larger POST bodies are refused `too_large`. |
-| `maxListResponseBytes` | Maximum tool list response (bytes) | integer ≥ 1024 | `1048576` | Larger list responses pass through unfiltered, and calls fall back to unknown-tool handling until the next list the guard can inspect. |
+| `maxListResponseBytes` | Maximum tool list response (bytes) | integer ≥ 1024 | `1048576` | Larger list responses pass through unfiltered, and calls fall back to unknown-tool handling until the next list the guard can inspect. A list over the gateway's own buffer limit is answered by the gateway with an error, and a list that no longer fits that limit once changed gets a JSON-RPC `internal_error`. Keep this at or below the gateway's buffer limit (see **Deployment & Ordering**). |
 | `maxToolNameBytes` | Maximum tool name (bytes) | integer 1–1024 | `256` | Longer tool names in a call are refused `invalid_params`. |
 | `maxBatchSize` | Maximum JSON-RPC batch size | integer 1–256 | `32` | Largest JSON-RPC batch (MCP 2025-03-26). |
 | `maxCachedTools` | Maximum tools remembered per catalog | integer ≥ 1 | `5000` | Tools remembered per catalog. When full, new tools stay unknown (fail closed); nothing is evicted. |
 | `maxCatalogBytes` | Maximum catalog size (bytes) | integer ≥ 4096 | `524288` | Size limit per catalog, with the same fail-closed behaviour. |
-| `maxCatalogs` | Maximum catalogs kept | integer ≥ 1 | `1000` | Catalogs kept in the gateway's shared cache (one per API instance, configuration and partition). |
+| `maxCatalogs` | Maximum catalogs kept | integer ≥ 1 | `1000` | Catalogs per API instance and configuration: one per partition, or a single one without `catalogPartition`. Nothing is evicted. When the limit is reached, a new partition's catalog is refused, its tools stay unknown, and its calls are refused `unknown_tool` (fail closed). |
 
 ## Caller attributes
 
@@ -221,7 +221,8 @@ The guard writes one JSON event per line through the gateway's runtime log. To s
 | `classification_downgrade_ignored` | warn | A server tried to lower a tool's class (possible rug pull). |
 | `catalog_stale` / `catalog_fresh` | warn / info | The guard stopped / resumed trusting what it learned. |
 | `request_rejected` | warn | A protocol error was returned. |
-| `pin_capacity_exhausted` | warn | `maxCachedTools` or `maxCatalogBytes` was reached. |
+| `pin_capacity_exhausted` | warn | A limit was reached (`limit`: `maxCachedTools`, `maxCatalogBytes` or `maxCatalogs`); the tools concerned stay unknown. |
+| `catalog_merge_retry_exhausted` | warn | What this worker learned is kept by this worker only, until a later save succeeds: other workers kept saving at the same moment, the shared store couldn't be read or written, or `maxCatalogs` was reached after this worker started using the catalog. |
 | `partition_unavailable` | warn | `catalogPartition` returned no usable value. |
 
 Repeated warnings of the same type are limited to one per minute per catalog.

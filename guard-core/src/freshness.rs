@@ -15,6 +15,8 @@ pub enum StaleReason {
     ResponseInvalid,
     UnsupportedContentType,
     InternalError,
+    /// The gateway ended the response before its body was complete.
+    Incomplete,
     /// `notifications/tools/list_changed` seen in a parsed stream.
     ListChanged,
 }
@@ -28,6 +30,7 @@ impl StaleReason {
             StaleReason::ResponseInvalid => "response_invalid",
             StaleReason::UnsupportedContentType => "unsupported_content_type",
             StaleReason::InternalError => "internal_error",
+            StaleReason::Incomplete => "incomplete",
             StaleReason::ListChanged => "list_changed",
         }
     }

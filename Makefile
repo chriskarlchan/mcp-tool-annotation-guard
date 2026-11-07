@@ -13,6 +13,23 @@ FLEX_IMAGE              := mulesoft/flex-gateway:1.13.0
 # When true, publish/release skip re-publishing the definition if its content matches the version
 # already in Exchange, pointing the implementation dependency at that published definition instead.
 SKIP_UNCHANGED_DEFINITION ?= true
+# Minimum Omni Gateway runtime declared in Exchange. The policy stops request
+# processing while it reads a body, which needs 1.11.4 or later.
+# `pdk policy-project build-asset-files` always writes 1.6.1, so
+# build-asset-files corrects the generated metadata, and publish and release
+# check it before uploading. Every file in target/implementation* is uploaded,
+# so the temporary file is written outside those folders.
+MIN_RUNTIME_VERSION := 1.11.4
+
+ifeq ($(OS), Windows_NT)
+	IMPLEMENTATION_METADATA = 'target/implementation/metadata.yaml', 'target/implementation-dev/metadata.yaml'
+	SET_MIN_RUNTIME   = foreach ($$f in $(IMPLEMENTATION_METADATA)) { (Get-Content $$f) -replace '^minRuntimeVersion:.*', 'minRuntimeVersion: $(MIN_RUNTIME_VERSION)' | Set-Content $$f }
+	CHECK_MIN_RUNTIME = foreach ($$f in $(IMPLEMENTATION_METADATA)) { if (-not (Select-String -Path $$f -CaseSensitive -Quiet -Pattern ('^minRuntimeVersion: ' + [regex]::Escape('$(MIN_RUNTIME_VERSION)') + '$$'))) { Write-Error "$$f does not declare minRuntimeVersion $(MIN_RUNTIME_VERSION)"; exit 1 } }
+else
+	IMPLEMENTATION_METADATA = target/implementation/metadata.yaml target/implementation-dev/metadata.yaml
+	SET_MIN_RUNTIME   = for f in $(IMPLEMENTATION_METADATA); do sed 's/^minRuntimeVersion:.*/minRuntimeVersion: $(MIN_RUNTIME_VERSION)/' "$$f" > target/metadata.yaml.tmp && mv target/metadata.yaml.tmp "$$f" || exit 1; done
+	CHECK_MIN_RUNTIME = for f in $(IMPLEMENTATION_METADATA); do grep -qxF 'minRuntimeVersion: $(MIN_RUNTIME_VERSION)' "$$f" || { echo "$$f does not declare minRuntimeVersion $(MIN_RUNTIME_VERSION)" >&2; exit 1; }; done
+endif
 
 ifeq ($(OS), Windows_NT)
     SHELL = powershell.exe
@@ -76,16 +93,24 @@ test-coverage: build tests/config/registration.yaml ## Run tests with coverage. 
 
 .PHONY: publish
 publish: build ## Publish a development version of the policy
+	@$(CHECK_MIN_RUNTIME)
 	anypoint-cli-v4 pdk policy-project publish --binary-path $(TARGET_DIR)/$(CRATE_NAME).wasm --implementation-gcl-path $(TARGET_DIR)/$(CRATE_NAME)_implementation.yaml --skip-unchanged-definition=$(SKIP_UNCHANGED_DEFINITION)
 
 .PHONY: release
 release: build ## Publish a release version
+	@$(CHECK_MIN_RUNTIME)
 	anypoint-cli-v4 pdk policy-project release --binary-path $(TARGET_DIR)/$(CRATE_NAME).wasm --implementation-gcl-path $(TARGET_DIR)/$(CRATE_NAME)_implementation.yaml --skip-unchanged-definition=$(SKIP_UNCHANGED_DEFINITION)
 
 .PHONY: build-asset-files
 build-asset-files: $(DEFINITION_SRC_GCL_PATH)
 	@anypoint-cli-v4 pdk policy-project build-asset-files --metadata '$(ANYPOINT_METADATA_JSON)'
+	@$(SET_MIN_RUNTIME)
+	@$(CHECK_MIN_RUNTIME)
 	@cargo anypoint config-gen -p -m $(DEFINITION_SRC_GCL_PATH) -o src/generated/config.rs
+
+.PHONY: check-min-runtime
+check-min-runtime: ## Check the built metadata declares MIN_RUNTIME_VERSION
+	@$(CHECK_MIN_RUNTIME)
 
 .PHONY: install-cargo-anypoint
 install-cargo-anypoint:

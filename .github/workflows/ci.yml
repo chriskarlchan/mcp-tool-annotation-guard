@@ -81,6 +81,8 @@ jobs:
         run: chmod a+w tests/config
       - name: make test
         run: make test
+      - name: Check the declared minimum runtime
+        run: make check-min-runtime
       - name: Check the release build contains no test-trap code
         run: |
           if grep -a -q x-guard-test-trap target/wasm32-wasip1/release/*.wasm; then

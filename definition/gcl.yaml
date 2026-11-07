@@ -294,7 +294,9 @@ spec:
           title: Maximum tool list response (bytes)
           description: >-
             Larger lists pass unfiltered and calls are refused until a list
-            fits.
+            fits. The gateway answers a list over its buffer limit with an
+            error, and a list that no longer fits that limit once changed
+            gets a JSON-RPC internal error instead.
           default: 1048576
         maxToolNameBytes:
           type: integer
@@ -317,5 +319,5 @@ spec:
         maxCatalogs:
           type: integer
           title: Maximum catalogs kept
-          description: One per API instance, configuration and partition.
+          description: Per API instance and configuration, one per partition. When full, new partitions are refused and their tools stay unknown.
           default: 1000

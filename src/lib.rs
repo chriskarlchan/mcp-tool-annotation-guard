@@ -24,7 +24,7 @@ use std::time::UNIX_EPOCH;
 
 use anyhow::{anyhow, Result};
 use pdk::authentication::{Authentication, AuthenticationData, AuthenticationHandler};
-use pdk::cache::{CacheBuilder, EvictionStrategy, LruStrategy};
+use pdk::data_storage::DataStorageBuilder;
 use pdk::hl::timer::Clock;
 use pdk::hl::*;
 use pdk::logger;
@@ -43,10 +43,11 @@ use guard_core::log::{self as guard_log, Context, Event, LogLevel, WarnLimiter};
 use guard_core::response::{self, ProtocolError, Reply};
 
 use crate::generated::config::Config as SchemaConfig;
-use crate::store::CacheStore;
+use crate::store::LocalStore;
 
-/// ID of the shared catalog cache. The PDK scopes it to this policy instance.
-const CATALOG_CACHE_ID: &str = "mcp-tool-annotation-guard-catalogs";
+/// Local Data Storage ID of the shared catalogs. The PDK scopes it to this
+/// policy binding.
+const CATALOG_STORAGE_ID: &str = "catalogs";
 
 /// Remembered `(event, catalog)` pairs of the per-worker `warn` rate limiter.
 const WARN_LIMITER_CAPACITY: usize = 1024;
@@ -61,7 +62,7 @@ struct Policy {
     /// `configFingerprint` of the catalog key.
     fingerprint: String,
     /// Worker-local catalog copies over the shared store.
-    catalogs: RefCell<Catalogs<CacheStore>>,
+    catalogs: RefCell<Catalogs<LocalStore>>,
     limiter: RefCell<WarnLimiter>,
     clock: Clock,
 }
@@ -285,7 +286,7 @@ impl Policy {
     fn with_list<R>(
         &self,
         request: &ListRequest,
-        step: impl FnOnce(&Pending, &mut Env<'_, CacheStore>) -> R,
+        step: impl FnOnce(&Pending, &mut Env<'_, LocalStore>) -> R,
     ) -> R {
         let context = request.info.context(self, Some(&request.pending.caller));
         let mut log = |event: &Event<'_>, catalog: Option<&str>| self.log(event, &context, catalog);
@@ -439,6 +440,31 @@ async fn request_filter(
     }
 }
 
+/// Marks the catalog stale when it is dropped while armed: the gateway ended
+/// a list response (body over its buffer limit, upstream reset, timeout)
+/// after its headers were accepted for inspection but before its body was
+/// complete, so the list was never inspected.
+struct Unfinished<'a> {
+    policy: &'a Policy,
+    request: &'a ListRequest,
+    armed: bool,
+}
+
+impl Unfinished<'_> {
+    /// The whole body arrived: nothing to mark.
+    fn finished(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for Unfinished<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.policy.with_list(self.request, list::on_incomplete);
+        }
+    }
+}
+
 /// `tools/list` responses. The headers are checked first, so a
 /// response that cannot be filtered is never buffered.
 async fn response_filter(state: ResponseState, data: RequestData<Carried>, policy: &Policy) {
@@ -462,21 +488,46 @@ async fn response_filter(state: ResponseState, data: RequestData<Carried>, polic
     };
 
     // Stop iteration: the client receives nothing until this filter returns.
+    // If the gateway ends the response before the whole body arrives, this
+    // future is dropped while it waits, and the guard marks the catalog stale.
+    let unfinished = Unfinished {
+        policy,
+        request: &request,
+        armed: true,
+    };
     let state = state.into_headers_body_state().await;
+    unfinished.finished();
     let handler = state.handler();
     let body = handler.body();
     let new_body = match policy.with_list(&request, |pending, env| {
         list::on_body(mode, &body, pending, env)
     }) {
         Outcome::Forward => return,
-        Outcome::Rewrite(new_body) => new_body,
+        Outcome::ForwardNoStore => {
+            for (name, value) in &list::HeaderChanges::no_store().set {
+                handler.set_header(name, value);
+            }
+            return;
+        }
+        Outcome::Rewrite(new_body) => new_body.into_bytes(),
     };
-    if handler.set_body(new_body.as_bytes()).is_err() {
-        policy.with_list(&request, list::on_rewrite_failed);
-        return;
-    }
+    // The guard must change this list. If the gateway refuses the new body
+    // (it is over the gateway's buffer limit), the client gets an error
+    // instead of a list that should have been filtered.
+    let written = if handler.set_body(&new_body).is_ok() {
+        new_body
+    } else {
+        let errors = policy.with_list(&request, |pending, env| {
+            list::on_rewrite_refused(mode, &body, pending, env)
+        });
+        if handler.set_body(&errors).is_err() {
+            policy.with_list(&request, list::on_rewrite_failed);
+            return;
+        }
+        errors
+    };
     // The PDK does not adjust Content-Length after `set_body`.
-    let changes = list::header_changes(new_body.len(), headers.get("content-length").is_some());
+    let changes = list::header_changes(written.len(), headers.get("content-length").is_some());
     for name in changes.remove {
         handler.remove_header(name);
     }
@@ -500,7 +551,7 @@ async fn configure(
     launcher: Launcher,
     Configuration(bytes): Configuration,
     metadata: Metadata,
-    cache_builder: CacheBuilder,
+    storage: DataStorageBuilder,
     clock: Clock,
 ) -> Result<()> {
     // An error here makes the gateway answer every request with 503: the
@@ -520,20 +571,21 @@ async fn configure(
         .filter(|id| !id.is_empty())
         .unwrap_or_else(|| metadata.policy_metadata.filter_name.clone());
 
-    // Shared store sizing: LRU, `max_entries = limits.maxCatalogs`, no
-    // TTL. One shard keeps the LRU order exact.
-    let cache = cache_builder
-        .new(CATALOG_CACHE_ID.to_string())
-        .eviction_strategy(EvictionStrategy::Lru(LruStrategy::default().with_shards(1)))
-        .max_entries(config.limits.max_catalogs)
-        .build();
+    // Nothing is evicted: an index per API instance and configuration admits
+    // at most `limits.maxCatalogs` catalogs. Catalogs of an earlier
+    // configuration are removed first.
+    let fingerprint = catalog::classification_fingerprint(&config.classification);
+    let store = LocalStore::new(storage.local(CATALOG_STORAGE_ID));
+    catalog::remove_other_configurations(&store, &api_instance, &fingerprint);
+    let catalogs = Catalogs::new(
+        store,
+        CatalogSettings::from_config(&config),
+        catalog::index_key(&api_instance, &fingerprint),
+    );
 
     let policy = Policy {
-        fingerprint: catalog::classification_fingerprint(&config.classification),
-        catalogs: RefCell::new(Catalogs::new(
-            CacheStore::new(cache),
-            CatalogSettings::from_config(&config),
-        )),
+        fingerprint,
+        catalogs: RefCell::new(catalogs),
         limiter: RefCell::new(WarnLimiter::new(WARN_LIMITER_CAPACITY)),
         caller_attributes: schema.caller_attributes,
         catalog_partition: schema.catalog_partition,

@@ -4,8 +4,8 @@
 //! local Omni Gateway. They cover what the pdk-unit tests cannot: the real
 //! gateway's handling of a replaced body (`Content-Length`), the
 //! `Accept-Encoding` rewrite reaching the upstream and encoded responses,
-//! buffered SSE, and the catalog learned on the response leg
-//! governing a later request.
+//! buffered SSE, a list the gateway will not take back once changed, and
+//! the catalog learned on the response leg governing a later request.
 
 mod common;
 
@@ -37,6 +37,22 @@ fn list_body() -> String {
         {"name": "drop", "annotations": {"destructiveHint": true}}
     ]}})
     .to_string()
+}
+
+/// A list of read-only tools, `len` bytes long, with a `cacheScope` the
+/// guard must change: the changed list no longer fits the gateway's buffer.
+fn near_limit_list(len: usize) -> String {
+    let with = |pad: usize| {
+        json!({"jsonrpc": "2.0", "id": 1, "result": {"cacheScope": 0, "tools": [
+            {"name": "search", "annotations": {"readOnlyHint": true}},
+            {"name": "notes", "description": "x".repeat(pad), "annotations": {"readOnlyHint": true}}
+        ]}})
+        .to_string()
+    };
+    let base = with(0).len();
+    let body = with(len - base);
+    assert_eq!(body.len(), len);
+    body
 }
 
 struct Reply {
@@ -200,6 +216,36 @@ async fn list_processing() -> anyhow::Result<()> {
                 .body(json!({"jsonrpc": "2.0", "id": 1, "result": {"tools": tools}}).to_string());
         })
         .await;
+    // Nothing hidden, but the cache scope must become private.
+    let scope_list = server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .header("x-test-reply", "scope")
+                .body_contains("tools/list");
+            then.status(200)
+                .header("content-type", "application/json")
+                .header("etag", "\"v1\"")
+                .body(
+                    json!({"jsonrpc": "2.0", "id": 1, "result": {
+                        "tools": [{"name": "search", "annotations": {"readOnlyHint": true}}],
+                        "ttlMs": 60000, "cacheScope": "public"}})
+                    .to_string(),
+                );
+        })
+        .await;
+    // Fits the gateway's buffer (1 MiB) by 4 bytes; with `"cacheScope":"private"`
+    // it would not.
+    let near_limit = server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .header("x-test-reply", "near-limit")
+                .body_contains("tools/list");
+            then.status(200)
+                .header("content-type", "application/json")
+                .header("etag", "\"v1\"")
+                .body(near_limit_list(1024 * 1024 - 4));
+        })
+        .await;
     let drop_call = server
         .mock_async(|when, then| {
             when.method(POST).body_contains("\"name\":\"drop\"");
@@ -246,6 +292,20 @@ async fn list_processing() -> anyhow::Result<()> {
     );
     sse_list.assert_hits_async(1).await;
 
+    // A list with nothing hidden is still meant for this caller only: a
+    // shared cache scope becomes private, and the validators are removed.
+    let reply = post(&client, &url, list(), "scope").await?;
+    assert_eq!(reply.status, 200);
+    let body: Value = serde_json::from_slice(&reply.body).unwrap_or(Value::Null);
+    assert_eq!(body.pointer("/result/cacheScope"), Some(&json!("private")));
+    assert_eq!(body.pointer("/result/ttlMs"), Some(&json!(60000)));
+    assert_eq!(reply.tool_names(), vec!["search"]);
+    let length = reply.body.len().to_string();
+    assert_eq!(reply.header("content-length"), Some(length.as_str()));
+    assert_eq!(reply.header("cache-control"), Some("no-store"));
+    assert_eq!(reply.header("etag"), None);
+    scope_list.assert_hits_async(1).await;
+
     // A compressed response reaches the client as sent (the
     // gateway does not decompress it) and marks the catalog stale.
     let reply = post(&client, &url, list(), "gzip").await?;
@@ -260,6 +320,34 @@ async fn list_processing() -> anyhow::Result<()> {
     assert_eq!(
         body.pointer("/error/data/reason"),
         Some(&json!("unknown_tool"))
+    );
+    drop_call.assert_hits_async(0).await;
+
+    // The guard must change this list but the gateway refuses the changed
+    // body: the client gets an error instead of the list.
+    let reply = post(&client, &url, list(), "near-limit").await?;
+    assert_eq!(reply.status, 200);
+    let body: Value = serde_json::from_slice(&reply.body).unwrap_or(Value::Null);
+    assert_eq!(body.get("id"), Some(&json!(1)), "{body}");
+    assert_eq!(body.pointer("/error/code"), Some(&json!(-32603)));
+    assert_eq!(
+        body.pointer("/error/data/reason"),
+        Some(&json!("internal_error"))
+    );
+    assert!(body.get("result").is_none());
+    let length = reply.body.len().to_string();
+    assert_eq!(reply.header("content-length"), Some(length.as_str()));
+    assert_eq!(reply.header("cache-control"), Some("no-store"));
+    assert_eq!(reply.header("etag"), None);
+    near_limit.assert_hits_async(1).await;
+
+    // The list itself was inspected, so the catalog is fresh again and
+    // keeps what it learned: `drop` is known and destructive.
+    let reply = post(&client, &url, call(4, "drop"), "none").await?;
+    let body: Value = serde_json::from_slice(&reply.body).unwrap_or(Value::Null);
+    assert_eq!(
+        body.pointer("/error/data/reason"),
+        Some(&json!("level_insufficient"))
     );
     drop_call.assert_hits_async(0).await;
 

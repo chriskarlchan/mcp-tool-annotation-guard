@@ -8,6 +8,8 @@
 //! order and numeric tokens — is preserved exactly.
 //!
 //! Design choices:
+//! - In JSON mode one leading byte-order mark is removed before inspection,
+//!   as `fetch().json()` and `json.loads` do, and put back on rewrite.
 //! - Duplicate keys anywhere in a list response body make it
 //!   `response_invalid` (the spec requires it for the envelope, `result`,
 //!   tool entries and annotations; nothing else is in a list response).
@@ -30,7 +32,7 @@ use crate::classify::{classify_tool, Classified, Outcome};
 use crate::config::{Class, Config};
 use crate::envelope::{check_strict_json, is_identity_encoding, parse_message, Kind, StrictError};
 use crate::freshness::StaleReason;
-use crate::ids::Id;
+use crate::ids::{self, Id};
 
 // --- pre-checks ---------------------------------------------------------------
 
@@ -69,8 +71,18 @@ enum MediaType {
     EventStream,
 }
 
+/// The WHATWG Encoding labels for UTF-8.
+const UTF8_LABELS: [&str; 6] = [
+    "unicode-1-1-utf-8",
+    "unicode11utf8",
+    "unicode20utf8",
+    "utf-8",
+    "utf8",
+    "x-unicode20utf8",
+];
+
 /// Parses `type/subtype; params` (case-insensitive); `charset` must be absent
-/// or `utf-8`, other parameters are ignored.
+/// or a UTF-8 label, other parameters are ignored.
 fn media_type(value: &str) -> Option<MediaType> {
     let mut parts = value.split(';');
     let essence = parts.next()?.trim().to_ascii_lowercase();
@@ -79,7 +91,10 @@ fn media_type(value: &str) -> Option<MediaType> {
         let key = kv.next().unwrap_or_default().trim();
         if key.eq_ignore_ascii_case("charset") {
             let charset = kv.next().unwrap_or_default().trim().trim_matches('"');
-            if !charset.eq_ignore_ascii_case("utf-8") {
+            if !UTF8_LABELS
+                .iter()
+                .any(|label| charset.eq_ignore_ascii_case(label))
+            {
                 return None;
             }
         }
@@ -113,14 +128,41 @@ struct Target {
     /// Byte range of the `result.tools` array in the source.
     tools: Range<usize>,
     entries: Vec<Entry>,
+    /// Byte range of the `result.cacheScope` value, when it is not
+    /// `"private"`.
+    cache_scope: Option<Range<usize>>,
+}
+
+/// A rewritten list body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rewritten {
+    pub body: String,
+    /// Entries removed.
+    pub removed: usize,
+    /// `cacheScope` values set to `"private"`.
+    pub scoped: usize,
+}
+
+impl Rewritten {
+    /// `true` when the body says something other than the original:
+    /// an entry was removed or a `cacheScope` was changed.
+    pub fn changed(&self) -> bool {
+        self.removed > 0 || self.scoped > 0
+    }
 }
 
 /// A validated list response with at least one matching `result`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListResult {
+    /// The body started with a byte-order mark (JSON mode), removed before
+    /// inspection and re-emitted by [`ListResult::rewrite`].
+    bom: bool,
     source: String,
     targets: Vec<Target>,
 }
+
+/// The byte-order mark clients remove from the start of a UTF-8 body.
+pub const BOM: &str = "\u{feff}";
 
 /// What inspecting one JSON document found.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -147,6 +189,7 @@ pub fn inspect(body: &[u8], expected: &[Id], config: &Config) -> Inspection {
     match inspect_source(source, expected, config) {
         Ok(Some(targets)) if targets.is_empty() => Inspection::ErrorsOnly,
         Ok(Some(targets)) => Inspection::Lists(ListResult {
+            bom: false,
             source: source.to_owned(),
             targets,
         }),
@@ -156,9 +199,15 @@ pub fn inspect(body: &[u8], expected: &[Id], config: &Config) -> Inspection {
 }
 
 /// JSON mode: a body without a matching response is `response_invalid`.
+/// One leading byte-order mark is removed first, as clients do.
 pub fn inspect_json(body: &[u8], expected: &[Id], config: &Config) -> Inspection {
+    let (bom, body) = match body.strip_prefix(BOM.as_bytes()) {
+        Some(rest) => (true, rest),
+        None => (false, body),
+    };
     match inspect(body, expected, config) {
         Inspection::NotFound => Inspection::Stale(StaleReason::ResponseInvalid),
+        Inspection::Lists(list) => Inspection::Lists(ListResult { bom, ..list }),
         other => other,
     }
 }
@@ -191,6 +240,10 @@ fn inspect_source(
             continue;
         };
         let Some(position) = expected.iter().position(|e| *e == id) else {
+            // Another ID, unless a client could still read it as a marked one.
+            if ids::may_answer(id.raw(), expected) {
+                return Err(invalid);
+            }
             continue;
         };
         if !matched.insert(position) {
@@ -237,9 +290,20 @@ fn inspect_result(source: &str, result: &RawValue, config: &Config) -> Result<Ta
             tool: entry_tool(item, config),
         });
     }
+    // A filtered list is meant for one caller only, so any other value
+    // (`"public"`, or something invalid) is replaced.
+    let cache_scope = match members.get("cacheScope") {
+        Some(raw)
+            if serde_json::from_str::<String>(raw.get()).ok().as_deref() != Some("private") =>
+        {
+            Some(range_in(source, raw.get())?)
+        }
+        _ => None,
+    };
     Ok(Target {
         tools: range_in(source, tools.get())?,
         entries,
+        cache_scope,
     })
 }
 
@@ -310,37 +374,64 @@ impl ListResult {
     }
 
     /// The source with each matched `tools` array reduced to the valid
-    /// entries for which `keep` is true. Returns the new body and the
-    /// number of entries removed.
-    pub fn rewrite(&self, mut keep: impl FnMut(&str) -> bool) -> (String, usize) {
-        let mut out = String::with_capacity(self.source.len());
-        let mut removed = 0;
-        let mut cursor = 0;
+    /// entries for which `keep` is true, and each matched `cacheScope` set to
+    /// `"private"`. Every other byte is unchanged.
+    pub fn rewrite(&self, mut keep: impl FnMut(&str) -> bool) -> Rewritten {
+        enum Edit<'t> {
+            Tools(&'t Target),
+            Scope,
+        }
+        // The edited values never overlap: each is a different member of one
+        // `result`, and each `result` belongs to a different message.
+        let mut edits: Vec<(&Range<usize>, Edit<'_>)> = Vec::new();
         for target in &self.targets {
-            out.push_str(
-                self.source
-                    .get(cursor..target.tools.start)
-                    .unwrap_or_default(),
-            );
-            out.push('[');
-            let mut first = true;
-            for entry in &target.entries {
-                let kept = entry.tool.as_ref().is_some_and(|tool| keep(&tool.name));
-                if !kept {
-                    removed += 1;
-                    continue;
-                }
-                if !first {
-                    out.push(',');
-                }
-                first = false;
-                out.push_str(self.source.get(entry.range.clone()).unwrap_or_default());
+            edits.push((&target.tools, Edit::Tools(target)));
+            if let Some(range) = &target.cache_scope {
+                edits.push((range, Edit::Scope));
             }
-            out.push(']');
-            cursor = target.tools.end;
+        }
+        edits.sort_by_key(|(range, _)| range.start);
+
+        let mut out = String::with_capacity(self.source.len() + BOM.len());
+        if self.bom {
+            out.push_str(BOM);
+        }
+        let mut rewritten = Rewritten {
+            body: String::new(),
+            removed: 0,
+            scoped: 0,
+        };
+        let mut cursor = 0;
+        for (range, edit) in edits {
+            out.push_str(self.source.get(cursor..range.start).unwrap_or_default());
+            match edit {
+                Edit::Tools(target) => {
+                    out.push('[');
+                    let mut first = true;
+                    for entry in &target.entries {
+                        let kept = entry.tool.as_ref().is_some_and(|tool| keep(&tool.name));
+                        if !kept {
+                            rewritten.removed += 1;
+                            continue;
+                        }
+                        if !first {
+                            out.push(',');
+                        }
+                        first = false;
+                        out.push_str(self.source.get(entry.range.clone()).unwrap_or_default());
+                    }
+                    out.push(']');
+                }
+                Edit::Scope => {
+                    out.push_str("\"private\"");
+                    rewritten.scoped += 1;
+                }
+            }
+            cursor = range.end;
         }
         out.push_str(self.source.get(cursor..).unwrap_or_default());
-        (out, removed)
+        rewritten.body = out;
+        rewritten
     }
 }
 
@@ -425,6 +516,27 @@ mod tests {
             precheck(200, None, Some("text/event-stream; foo=bar")),
             Precheck::Sse
         );
+        // Every WHATWG label for UTF-8 is UTF-8.
+        for label in ["utf8", "UTF8", "unicode-1-1-utf-8", "x-unicode20utf8"] {
+            assert_eq!(
+                precheck(
+                    200,
+                    None,
+                    Some(&format!("application/json; charset={label}"))
+                ),
+                Precheck::Json,
+                "{label}"
+            );
+            assert_eq!(
+                precheck(
+                    200,
+                    None,
+                    Some(&format!("text/event-stream;charset={label}"))
+                ),
+                Precheck::Sse,
+                "{label}"
+            );
+        }
         for unsupported in [
             None,
             Some("application/json; charset=iso-8859-1"),
@@ -465,7 +577,7 @@ mod tests {
     #[test]
     fn filtering_preserves_every_other_byte() {
         let result = lists(LIST, &["1"], &config(json!({})));
-        let (body, removed) = result.rewrite(|name| name != "drop");
+        let Rewritten { body, removed, .. } = result.rewrite(|name| name != "drop");
         assert_eq!(removed, 1);
         assert_eq!(
             body,
@@ -476,14 +588,18 @@ mod tests {
         );
         assert!(body.contains(r#""maximum":1.50"#) && body.contains("12345678901234567890123"));
         assert!(body.ends_with(r#""nextCursor":"abc","zeta":12345678901234567890123}}"#));
-        let (unchanged, removed) = result.rewrite(|_| true);
+        let Rewritten {
+            body: unchanged,
+            removed,
+            ..
+        } = result.rewrite(|_| true);
         assert_eq!((unchanged.as_str(), removed), (LIST, 0));
     }
 
     #[test]
     fn removing_everything_leaves_an_empty_array_and_the_cursor() {
         let result = lists(LIST, &["1"], &config(json!({})));
-        let (body, removed) = result.rewrite(|_| false);
+        let Rewritten { body, removed, .. } = result.rewrite(|_| false);
         assert_eq!(removed, 3);
         assert!(body.contains(r#""tools":[],"nextCursor":"abc""#), "{body}");
     }
@@ -497,7 +613,9 @@ mod tests {
         let result = lists(body, &["1"], &c);
         assert_eq!(result.invalid_entries(), 7);
         assert_eq!(result.observations().len(), 1);
-        let (out, removed) = result.rewrite(|_| true);
+        let Rewritten {
+            body: out, removed, ..
+        } = result.rewrite(|_| true);
         assert_eq!(removed, 7);
         assert!(
             out.contains(r#""tools":[{"name":"ok","annotations":{"readOnlyHint":true}}]"#),
@@ -586,11 +704,27 @@ mod tests {
                 r#"{"jsonrpc":"2.0","id":1,"result":"#,
                 stale(StaleReason::ParseError),
             ),
-            ("\u{feff}{}", stale(StaleReason::ParseError)),
+            ("\u{feff}{}", invalid.clone()),
+            ("\u{feff}\u{feff}{}", stale(StaleReason::ParseError)),
         ];
         for (body, expected) in cases {
             assert_eq!(outcome(body, &["1"]), expected, "{body}");
         }
+    }
+
+    #[test]
+    fn a_leading_bom_is_removed_like_a_client_does() {
+        let body = format!("\u{feff}{LIST}");
+        let result = lists(&body, &["1"], &config(json!({})));
+        let Rewritten {
+            body: out, removed, ..
+        } = result.rewrite(|name| name != "drop");
+        assert_eq!(removed, 1);
+        assert_eq!(
+            crate::client_view::json_list(out.as_bytes(), 1),
+            Some(vec!["search".to_owned(), "edit".to_owned()]),
+            "{out:?}"
+        );
     }
 
     #[test]
@@ -613,11 +747,34 @@ mod tests {
     }
 
     #[test]
+    fn a_batch_element_a_client_could_read_for_the_list_id_marks_stale() {
+        let error = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"x"}}"#;
+        for other_id in [r#""1""#, r#""0x1""#, r#"" 1""#] {
+            let other = format!(
+                r#"{{"jsonrpc":"2.0","id":{other_id},"result":{{"tools":[{{"name":"drop"}}]}}}}"#
+            );
+            for answer in [LIST, error] {
+                let body = format!("[{other},{answer}]");
+                assert_eq!(
+                    outcome(&body, &["1"]),
+                    Inspection::Stale(StaleReason::ResponseInvalid),
+                    "{body}"
+                );
+            }
+        }
+        // A response to another request in the batch is still fine.
+        let body = format!(r#"[{{"jsonrpc":"2.0","id":2,"result":{{}}}},{LIST}]"#);
+        assert!(matches!(outcome(&body, &["1"]), Inspection::Lists(_)));
+    }
+
+    #[test]
     fn list_only_batches_rewrite_every_matching_element_in_any_order() {
         let body = r#"[{"jsonrpc":"2.0","id":"b","result":{"tools":[{"name":"x","annotations":{"readOnlyHint":true}},{"name":"y"}]}},{"jsonrpc":"2.0","id":"a","error":{"code":1,"message":"m"}},{"jsonrpc":"2.0","id":"c","result":{"tools":[{"name":"y"}],"nextCursor":"n"}}]"#;
         let result = lists(body, &[r#""a""#, r#""b""#, r#""c""#], &config(json!({})));
         assert_eq!(result.observations().len(), 3);
-        let (out, removed) = result.rewrite(|name| name == "x");
+        let Rewritten {
+            body: out, removed, ..
+        } = result.rewrite(|name| name == "x");
         assert_eq!(removed, 2);
         assert_eq!(
             out,
@@ -636,10 +793,58 @@ mod tests {
     }
 
     #[test]
+    fn a_cache_scope_other_than_private_becomes_private() {
+        let c = config(json!({}));
+        let rewrite = |body: &str| lists(body, &["1"], &c).rewrite(|name| name != "drop");
+        // Before or after the tools, escaped or not, any value but "private".
+        for (body, expected) in [
+            (
+                r#"{"jsonrpc":"2.0","id":1,"result":{"cacheScope":"public","tools":[{"name":"drop"}]}}"#,
+                r#"{"jsonrpc":"2.0","id":1,"result":{"cacheScope":"private","tools":[]}}"#,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"a"}],"cache\u0053cope" : 0}}"#,
+                r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"a"}],"cache\u0053cope" : "private"}}"#,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[],"cacheScope":"Private","ttlMs":5}}"#,
+                r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[],"cacheScope":"private","ttlMs":5}}"#,
+            ),
+        ] {
+            let Rewritten {
+                body: out,
+                removed,
+                scoped,
+            } = rewrite(body);
+            assert_eq!(out, expected);
+            assert_eq!(scoped, 1, "{body}");
+            assert_eq!(removed, usize::from(body.contains("drop")));
+        }
+        // Already private (even escaped) or absent: nothing to change.
+        for body in [
+            r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"a"}],"cacheScope":"priv\u0061te"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"a"}]}}"#,
+        ] {
+            let out = rewrite(body);
+            assert!(!out.changed(), "{body}");
+            assert_eq!(out.body, body);
+        }
+    }
+
+    #[test]
+    fn every_list_in_a_batch_gets_a_private_cache_scope() {
+        let body = r#"[{"jsonrpc":"2.0","id":2,"result":{"tools":[],"cacheScope":"public"}},{"jsonrpc":"2.0","id":1,"result":{"cacheScope":"public","tools":[]}}]"#;
+        let result = lists(body, &["1", "2"], &config(json!({})));
+        let out = result.rewrite(|_| true);
+        assert_eq!(out.scoped, 2);
+        assert_eq!(out.body, body.replace("public", "private"));
+    }
+
+    #[test]
     fn whitespace_between_entries_is_normalised_only_inside_the_array() {
         let body = "{ \"jsonrpc\" : \"2.0\", \"id\" : 1, \"result\" : { \"tools\" : [ {\"name\":\"a\"} ,\n {\"name\":\"b\"} ] } }";
         let result = lists(body, &["1"], &config(json!({})));
-        let (out, _) = result.rewrite(|_| true);
+        let Rewritten { body: out, .. } = result.rewrite(|_| true);
         assert_eq!(
             out,
             "{ \"jsonrpc\" : \"2.0\", \"id\" : 1, \"result\" : { \"tools\" : [{\"name\":\"a\"},{\"name\":\"b\"}] } }"

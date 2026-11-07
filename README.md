@@ -33,7 +33,7 @@ Built with the [Policy Development Kit (PDK)](https://docs.mulesoft.com/pdk/late
 | [docs/configuration.md](docs/configuration.md) | Every property, identity providers, refusals, logs |
 | [docs/examples.md](docs/examples.md) | Configurations A–H with the tools each caller sees |
 | [docs/security.md](docs/security.md) | What it protects against and what not, trust model, fail-closed behaviour, logging, hardening checklist |
-| [docs/deployment.md](docs/deployment.md) | Deployment prerequisites, recommended policy order |
+| [docs/deployment.md](docs/deployment.md) | Deployment prerequisites, recommended policy order, tested chain |
 | [docs/faq.md](docs/faq.md) | Common questions, related policies and specs |
 | [CHANGELOG.md](CHANGELOG.md) | Release notes |
 | [SECURITY.md](SECURITY.md) | How to report a vulnerability |
@@ -80,4 +80,4 @@ Some integration tests are opt-in because they need extra setup or measure timin
 
 ### Publishing
 
-`make publish` publishes a development version (asset ID ending `-dev`, timestamped version) to Exchange in your configured organization; `make release` publishes the release version. See [Uploading Custom Policies to Exchange](https://docs.mulesoft.com/pdk/latest/policies-pdk-publish-policies).
+`make publish` publishes a development version (asset ID ending `-dev`, timestamped version) to Exchange in your configured organization; `make release` publishes the release version. Both first check that the built metadata declares the minimum runtime, 1.11.4; `make check-min-runtime` runs that check on its own after a build. See [Uploading Custom Policies to Exchange](https://docs.mulesoft.com/pdk/latest/policies-pdk-publish-policies).

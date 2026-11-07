@@ -30,7 +30,11 @@ Every `tools/call` is held by the gateway and checked before anything is forward
 | A tool has no annotations | Treated as destructive, unless a name rule or override says otherwise |
 | A call names a tool the guard hasn't seen in a list it could inspect | Refused `unknown_tool`; the agent is told to list tools again |
 | A list couldn't be inspected (compressed, too large or invalid) | The guard stops trusting what it learned until it can inspect a list again (`catalog_stale`) |
-| The guard's tool memory is full | New tools stay unknown and are refused; nothing is evicted |
+| The gateway cut a list off before its end (buffer limit, upstream reset, timeout) | The same: the guard stops trusting what it learned (`catalog_stale`, reason `incomplete`) |
+| The gateway refused the filtered list body | The client gets a JSON-RPC `internal_error` for that list request, not the unfiltered list. If the gateway refuses that error too, the list passes unchanged and the guard stops trusting what it learned (`catalog_stale`, reason `internal_error`) |
+| A response a client could take for the list answer can't be validated (an `id` written differently, such as `"1"` for `1`, or JSON the guard can't parse) | The list passes unchanged and the guard stops trusting what it learned (`catalog_stale`, reason `response_invalid`) |
+| The guard's tool memory is full (`maxCachedTools`, `maxCatalogBytes`) | New tools stay unknown and are refused; nothing is evicted |
+| `maxCatalogs` catalogs are in use | A new partition's catalog is refused, and its calls are refused `unknown_tool`; nothing is evicted |
 | `catalogPartition` is set but gives no value for a request | Refused `partition_unavailable` |
 | A request can't be interpreted safely (malformed, compressed or too large) | Answered with a protocol error and not forwarded |
 | The configuration is invalid | Every MCP request is answered with HTTP 503, and the gateway log names the problem |
@@ -41,7 +45,7 @@ Every `tools/call` is held by the gateway and checked before anything is forward
 - **Never logged:** tokens, claims, tool arguments and tool results.
 - **Caller roles** appear in log events only when `logging.logCallerAttributes` is on. It's off by default.
 - **Refusals don't reveal role names** unless `denial.revealGrantNames` is on. It's off by default.
-- **Guard responses are never cached.** Every response the guard writes sets `Cache-Control: no-store`.
+- **Guard responses are never cached.** Every response the guard writes sets `Cache-Control: no-store`. While filtering is active, so does every list the guard inspects, also when it hides nothing, and an existing `cacheScope` other than `"private"` is set to `"private"`, so a cache that honours them doesn't hand one caller's list to another.
 - **Audit trail.** Refusals, would-be refusals in audit mode, hidden tools and class changes are logged as JSON events. Send them to a SIEM with the gateway's log forwarding (see **Configuration → Logs**).
 
 ## Hardening checklist

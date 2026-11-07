@@ -384,13 +384,14 @@ fn a_chunked_list_stays_without_content_length() {
 }
 
 #[test]
-fn a_list_with_nothing_hidden_is_forwarded_unchanged() {
+fn a_list_with_nothing_hidden_keeps_its_body_but_is_not_stored() {
     let mut h = harness(json!({}));
     let response = h.send(list_request("list-read-only"));
     let expected = list_body(json!([{"name": "search", "annotations": {"readOnlyHint": true}}]));
     assert_eq!(response.body(), expected.as_bytes());
     assert_eq!(response.header("etag"), Some("\"v1\""));
-    assert_eq!(response.header("cache-control"), None);
+    // The list is checked for this caller, so no shared cache may keep it.
+    assert_eq!(response.header("cache-control"), Some("no-store"));
 }
 
 // SSE, buffered whole
@@ -447,6 +448,30 @@ fn partitions_learn_separately() {
         "tenant b has not listed tools"
     );
     assert!(!h.forwarded());
+}
+
+// Nothing is evicted: once `limits.maxCatalogs` is reached, a new partition
+// gets no catalog and its tools stay unknown, while known partitions keep theirs.
+#[test]
+fn new_partitions_are_refused_at_max_catalogs() {
+    let mut h = harness(json!({
+        "catalogPartition": dw2pel("attributes.headers['x-tenant']"),
+        "limits": {"maxCatalogs": 1}
+    }));
+    h.send(list_request("list").with_header("x-tenant", "a"));
+    h.backend.next();
+    let b = h.send(list_request("list").with_header("x-tenant", "b"));
+    h.backend.next();
+    assert!(tool_names(&b).is_empty(), "tenant b's tools are unknown");
+    assert_eq!(b.header("cache-control"), Some("no-store"));
+    assert_eq!(
+        reason_of(&h.send(post(call(2, "search")).with_header("x-tenant", "b"))),
+        json!("unknown_tool")
+    );
+    assert!(!h.forwarded());
+    let a = h.send(post(call(3, "search")).with_header("x-tenant", "a"));
+    assert_eq!(a.status_code(), 200, "tenant a keeps its catalog");
+    assert!(h.forwarded());
 }
 
 // An uninspectable list marks the catalog stale; the next good list recovers.

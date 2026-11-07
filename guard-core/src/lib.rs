@@ -29,6 +29,9 @@ pub mod response;
 pub mod sse;
 
 #[cfg(test)]
+mod client_view;
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn crate_builds() {

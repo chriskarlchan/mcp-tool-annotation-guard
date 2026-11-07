@@ -237,6 +237,41 @@ pub fn protocol_error(err: &ProtocolError, sse_only: bool) -> Reply {
     reply
 }
 
+/// The body that replaces a `tools/list` response the guard has to change
+/// but cannot: one `internal_error` per list request. `batch` gives a JSON
+/// array (also used if there is not exactly one id); `sse` gives one SSE
+/// event per error instead.
+pub fn list_errors(ids: &[Id], batch: bool, sse: bool) -> Vec<u8> {
+    let errors = ids.iter().map(|id| {
+        protocol_body(&ProtocolError::Internal {
+            id: Some(id.clone()),
+        })
+    });
+    let mut body = Vec::new();
+    if sse {
+        for error in errors {
+            body.extend_from_slice(b"event: message\ndata: ");
+            body.extend_from_slice(&error);
+            body.extend_from_slice(b"\n\n");
+        }
+        return body;
+    }
+    let array = batch || ids.len() != 1;
+    if array {
+        body.push(b'[');
+    }
+    for (i, error) in errors.enumerate() {
+        if i > 0 {
+            body.push(b',');
+        }
+        body.extend_from_slice(&error);
+    }
+    if array {
+        body.push(b']');
+    }
+    body
+}
+
 // --- policy refusals ------------------------------------------------------------------
 
 impl<'a> Data<'a> {
@@ -789,6 +824,40 @@ mod tests {
         )));
         assert!(!wants_sse_only(Some("text/event-stream;q=0")));
         assert!(!wants_sse_only(Some("application/json")));
+    }
+
+    #[test]
+    fn list_errors_answer_every_list_request() {
+        let ids = [id("1"), id(r#""b""#)];
+        let error = |id: Value| {
+            json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32603,
+                "message": "The gateway rejected this request (internal_error).",
+                "data": {"policy": "mcp-tool-annotation-guard", "reason": "internal_error"}}})
+        };
+        let parse = |body: &[u8]| -> Value {
+            serde_json::from_slice(body).unwrap_or_else(|err| unreachable!("{err}"))
+        };
+        assert_eq!(
+            parse(&list_errors(&ids[..1], false, false)),
+            error(json!(1))
+        );
+        assert_eq!(
+            parse(&list_errors(&ids[..1], true, false)),
+            json!([error(json!(1))])
+        );
+        assert_eq!(
+            parse(&list_errors(&ids, false, false)),
+            json!([error(json!(1)), error(json!("b"))])
+        );
+        let sse = String::from_utf8(list_errors(&ids, true, true)).unwrap_or_default();
+        let events: Vec<&str> = sse.split_terminator("\n\n").collect();
+        assert_eq!(events.len(), 2);
+        for (event, expected) in events.iter().zip([error(json!(1)), error(json!("b"))]) {
+            let data = event
+                .strip_prefix("event: message\ndata: ")
+                .unwrap_or_default();
+            assert_eq!(parse(data.as_bytes()), expected);
+        }
     }
 
     #[test]

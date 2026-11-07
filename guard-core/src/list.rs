@@ -14,8 +14,12 @@
 //! - When the partition is unavailable, a response that cannot be inspected
 //!   is forwarded unfiltered like any uninspectable response, and no
 //!   catalog is updated.
-//! - A list from which nothing is removed is forwarded byte for byte, without
-//!   header changes.
+//! - A filtered list is meant for one caller: it is sent with
+//!   `Cache-Control: no-store`, and a `cacheScope` other than `"private"`
+//!   becomes `"private"`. When nothing is removed and `cacheScope` needs no
+//!   change, the body is forwarded byte for byte.
+//! - When the gateway refuses the filtered body, the client gets an
+//!   `internal_error` for each list request instead of the original.
 //! - When `list_changed` follows the list in a stream, the list's pins are
 //!   learned, the catalog ends stale, and the list is filtered against the
 //!   stale catalog (only overrides and `classifyByName` stay visible).
@@ -24,10 +28,11 @@ use crate::catalog::{Catalog, Catalogs, PartitionUnavailable, Pin, PinChange, St
 use crate::classify::Outcome as Classification;
 use crate::config::Config;
 use crate::decide::{self, Caller, CatalogView, ListHandling};
-use crate::filter::{self, Inspection, ListResult, Precheck, Tool};
+use crate::filter::{self, Inspection, ListResult, Precheck, Rewritten, Tool, BOM};
 use crate::freshness::StaleReason;
 use crate::ids::Id;
 use crate::log::Event;
+use crate::response::{self, ProtocolError};
 use crate::sse::{self, StreamInspection};
 
 /// What the request phase knew about a marked `tools/list` request; carried
@@ -53,7 +58,11 @@ pub enum BodyMode {
 pub enum Outcome {
     /// Forward the response unchanged.
     Forward,
-    /// Replace the body and apply the header hygiene.
+    /// A filtered list whose body needs no change: forward the body
+    /// unchanged and apply [`HeaderChanges::no_store`].
+    ForwardNoStore,
+    /// Replace the body and apply [`header_changes`]. If the gateway refuses
+    /// the new body, call [`on_rewrite_refused`].
     Rewrite(String),
 }
 
@@ -135,11 +144,48 @@ pub fn on_body<S: Store>(
     }
 }
 
-/// The gateway refused the rewritten body, so the original reaches the
+/// The gateway refused the filtered body. The original must not reach the
+/// client (it may show tools this caller may not see, or let a shared cache
+/// serve it to others), so it is replaced by an `internal_error` for each
+/// list request: one JSON array if the original was one, one SSE event per
+/// error in SSE mode. The catalog keeps what the list taught: the list was
+/// inspected, and the client never receives it. Returns the new body.
+pub fn on_rewrite_refused<S: Store>(
+    mode: BodyMode,
+    original: &[u8],
+    pending: &Pending,
+    env: &mut Env<'_, S>,
+) -> Vec<u8> {
+    let err = ProtocolError::Internal {
+        id: pending.ids.first().cloned(),
+    };
+    (env.log)(&Event::RequestRejected(&err), pending.key.as_deref().ok());
+    let sse = mode == BodyMode::Sse;
+    response::list_errors(&pending.ids, !sse && is_array(original), sse)
+}
+
+/// `true` when a JSON body (after an optional byte-order mark) is an array.
+fn is_array(body: &[u8]) -> bool {
+    let body = body.strip_prefix(BOM.as_bytes()).unwrap_or(body);
+    body.iter()
+        .find(|byte| !matches!(byte, b' ' | b'\t' | b'\n' | b'\r'))
+        .is_some_and(|byte| *byte == b'[')
+}
+
+/// The gateway refused even the error body, so the original reaches the
 /// client unfiltered: mark the catalog stale (`internal_error`) so that
 /// calls fall back to the stale rules.
 pub fn on_rewrite_failed<S: Store>(pending: &Pending, env: &mut Env<'_, S>) {
     fail(pending, StaleReason::InternalError, env);
+}
+
+/// The gateway ended the response after its headers but before the end of
+/// its body (a body over the gateway's buffer limit, an upstream reset or a
+/// timeout). The client never received the list, but it was never inspected
+/// either, so whatever changed in it is unknown: mark the catalog stale
+/// (`incomplete`).
+pub fn on_incomplete<S: Store>(pending: &Pending, env: &mut Env<'_, S>) {
+    fail(pending, StaleReason::Incomplete, env);
 }
 
 /// Header changes after a rewrite (header hygiene, lowercase names).
@@ -147,6 +193,17 @@ pub fn on_rewrite_failed<S: Store>(pending: &Pending, env: &mut Env<'_, S>) {
 pub struct HeaderChanges {
     pub remove: &'static [&'static str],
     pub set: Vec<(&'static str, String)>,
+}
+
+impl HeaderChanges {
+    /// For a filtered list whose body is unchanged: validators and digests
+    /// still match, so only `Cache-Control` is set.
+    pub fn no_store() -> HeaderChanges {
+        HeaderChanges {
+            remove: &[],
+            set: vec![("cache-control", "no-store".to_owned())],
+        }
+    }
 }
 
 /// `Content-Length` is set to the new length only when the upstream sent
@@ -182,7 +239,7 @@ fn process<S: Store>(
     changed_after: bool,
     pending: &Pending,
     env: &mut Env<'_, S>,
-    rewrite: impl FnOnce(&mut Rewrite<'_>) -> (String, usize),
+    rewrite: impl FnOnce(&mut Rewrite<'_>) -> Rewritten,
 ) -> Outcome {
     let Env {
         config,
@@ -245,28 +302,31 @@ fn filtered(
     key: Option<&str>,
     log: &mut Log<'_>,
     mut visible: impl FnMut(&str) -> bool,
-    rewrite: impl FnOnce(&mut Rewrite<'_>) -> (String, usize),
+    rewrite: impl FnOnce(&mut Rewrite<'_>) -> Rewritten,
 ) -> Outcome {
     let mut hidden: Vec<String> = Vec::new();
-    let (body, removed) = rewrite(&mut |name: &str| {
+    let rewritten = rewrite(&mut |name: &str| {
         let keep = visible(name);
         if !keep {
             hidden.push(name.to_owned());
         }
         keep
     });
-    if removed == 0 {
-        return Outcome::Forward;
+    if rewritten.removed > 0 {
+        let names: Vec<&str> = hidden.iter().map(String::as_str).collect();
+        log(
+            &Event::ListFiltered {
+                total,
+                hidden: &names,
+            },
+            key,
+        );
     }
-    let names: Vec<&str> = hidden.iter().map(String::as_str).collect();
-    log(
-        &Event::ListFiltered {
-            total,
-            hidden: &names,
-        },
-        key,
-    );
-    Outcome::Rewrite(body)
+    if rewritten.changed() {
+        Outcome::Rewrite(rewritten.body)
+    } else {
+        Outcome::ForwardNoStore
+    }
 }
 
 /// The pin candidate of a tool; blocked and overridden tools have none.
@@ -377,6 +437,7 @@ mod tests {
             let catalogs = Catalogs::new(
                 MemoryStore::default(),
                 CatalogSettings::from_config(&config),
+                "index".to_owned(),
             );
             World {
                 config,
@@ -483,7 +544,7 @@ mod tests {
     fn rewritten(outcome: Outcome) -> String {
         match outcome {
             Outcome::Rewrite(body) => body,
-            Outcome::Forward => unreachable!("expected a rewrite"),
+            other => unreachable!("expected a rewrite: {other:?}"),
         }
     }
 
@@ -510,11 +571,15 @@ mod tests {
     }
 
     #[test]
-    fn a_list_with_only_visible_tools_is_forwarded_unmodified() {
+    fn a_list_with_only_visible_tools_keeps_its_body() {
         let mut w = World::new(json!({}));
         let pending = w.pending(&[], Ok("k"));
         let body = list(json!([read("a"), read("b")]), json!({}));
-        assert_eq!(w.respond(JSON, &body, &pending, 100), Outcome::Forward);
+        // Still meant for this caller only, so it is not stored.
+        assert_eq!(
+            w.respond(JSON, &body, &pending, 100),
+            Outcome::ForwardNoStore
+        );
         assert_eq!(w.logged("list_filtered"), 0);
         assert_eq!(w.pin("k", "a"), Some(Class::Read));
     }
@@ -559,6 +624,51 @@ mod tests {
         let expected = json!({"tools": [read("search")], "resultType": "complete", "ttlMs": 60000,
             "cacheScope": "private", "_meta": {"x": 1}});
         assert_eq!(value.get("result"), Some(&expected));
+    }
+
+    #[test]
+    fn a_shared_cache_scope_becomes_private() {
+        let mut w = World::new(json!({}));
+        let pending = w.pending(&[], Ok("k"));
+        // Something removed, and nothing removed: both are meant for this caller only.
+        for (tools, visible) in [
+            (json!([read("search"), destructive("drop")]), 1),
+            (json!([read("search")]), 1),
+        ] {
+            let body = list(tools, json!({"ttlMs": 60000, "cacheScope": "public"}));
+            let out = rewritten(w.respond(JSON, &body, &pending, 100));
+            let value: Value = serde_json::from_str(&out).unwrap_or(Value::Null);
+            assert_eq!(value.pointer("/result/cacheScope"), Some(&json!("private")));
+            assert_eq!(value.pointer("/result/ttlMs"), Some(&json!(60000)));
+            assert_eq!(names(&out).len(), visible);
+        }
+        assert_eq!(w.logged("list_filtered"), 1, "only when a tool is hidden");
+        // A list that is already private keeps its body.
+        let private = list(json!([read("search")]), json!({"cacheScope": "private"}));
+        assert_eq!(
+            w.respond(JSON, &private, &pending, 100),
+            Outcome::ForwardNoStore
+        );
+    }
+
+    #[test]
+    fn an_sse_list_gets_a_private_cache_scope() {
+        let mut w = World::new(json!({}));
+        let pending = w.pending(&[], Ok("k"));
+        let data = list(json!([read("search")]), json!({"cacheScope": "public"}));
+        let out = rewritten(w.respond(SSE, &format!("data: {data}\n\n"), &pending, 100));
+        let private = list(json!([read("search")]), json!({"cacheScope": "private"}));
+        assert_eq!(out, format!("data: {private}\n\n"));
+    }
+
+    #[test]
+    fn without_filtering_the_cache_scope_is_kept() {
+        for value in [json!({"mode": "audit"}), json!({"filterToolsList": false})] {
+            let mut w = World::new(value);
+            let pending = w.pending(&[], Ok("k"));
+            let body = list(json!([read("search")]), json!({"cacheScope": "public"}));
+            assert_eq!(w.respond(JSON, &body, &pending, 100), Outcome::Forward);
+        }
     }
 
     // --- pagination and SSE ------------------------------------------------------------
@@ -613,7 +723,10 @@ mod tests {
         assert_eq!(w.logged("catalog_stale"), 1);
         // The next list clears it.
         let fresh = list(json!([read("search")]), json!({}));
-        assert_eq!(w.respond(JSON, &fresh, &pending, 200), Outcome::Forward);
+        assert_eq!(
+            w.respond(JSON, &fresh, &pending, 200),
+            Outcome::ForwardNoStore
+        );
         assert!(!w.stale("k", 200));
         assert_eq!(w.logged("catalog_fresh"), 1);
     }
@@ -819,6 +932,8 @@ mod tests {
 mod glue_tests {
     use super::*;
     use crate::catalog::{CatalogSettings, MemoryStore};
+    use crate::classify::Source;
+    use crate::config::Class;
     use std::collections::BTreeSet;
 
     #[test]
@@ -842,6 +957,7 @@ mod glue_tests {
         let mut catalogs = Catalogs::new(
             MemoryStore::default(),
             CatalogSettings::from_config(&config),
+            "index".to_owned(),
         );
         catalogs.record_success("k", 100, &[]);
         let pending = Pending {
@@ -860,5 +976,126 @@ mod glue_tests {
         on_rewrite_failed(&pending, &mut env);
         assert!(catalogs.read("k").is_stale(200, 0));
         assert_eq!(events, vec!["catalog_stale"]);
+    }
+
+    fn refused(mode: BodyMode, original: &[u8], ids: &[&str]) -> (String, Vec<String>, bool) {
+        let config = Config::from_json(b"{}").unwrap_or_else(|err| unreachable!("{err}"));
+        let mut catalogs = Catalogs::new(
+            MemoryStore::default(),
+            CatalogSettings::from_config(&config),
+            "index".to_owned(),
+        );
+        catalogs.record_success("k", 100, &[]);
+        let pending = Pending {
+            ids: ids
+                .iter()
+                .map(|raw| match Id::from_raw(raw) {
+                    crate::ids::IdToken::Valid(id) => id,
+                    _ => unreachable!("{raw}"),
+                })
+                .collect(),
+            caller: Caller::new(&config, BTreeSet::new()),
+            key: Ok("k".to_owned()),
+        };
+        let mut events = Vec::new();
+        let mut log = |event: &Event<'_>, _: Option<&str>| events.push(event.name().to_owned());
+        let mut env = Env {
+            config: &config,
+            catalogs: &mut catalogs,
+            now_ms: 200,
+            log: &mut log,
+        };
+        let body = on_rewrite_refused(mode, original, &pending, &mut env);
+        let stale = catalogs.read("k").is_stale(200, 0);
+        (String::from_utf8_lossy(&body).into_owned(), events, stale)
+    }
+
+    fn internal_error(id: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32603,
+            "message": "The gateway rejected this request (internal_error).",
+            "data": {"policy": "mcp-tool-annotation-guard", "reason": "internal_error"}}})
+    }
+
+    #[test]
+    fn a_refused_rewrite_answers_each_list_request_with_an_error() {
+        use serde_json::{json, Value};
+        let parse = |text: &str| serde_json::from_str::<Value>(text).unwrap_or(Value::Null);
+
+        let (body, events, stale) = refused(BodyMode::Json, br#"{"id":1}"#, &["1"]);
+        assert_eq!(parse(&body), internal_error(json!(1)));
+        assert_eq!(events, vec!["request_rejected"]);
+        assert!(!stale, "the list was inspected and its pins kept");
+
+        // A batch answer stays a batch, even with one list request in it.
+        let (body, _, _) = refused(BodyMode::Json, "\u{feff} \n[{}]".as_bytes(), &["1"]);
+        assert_eq!(parse(&body), json!([internal_error(json!(1))]));
+        let (body, _, _) = refused(BodyMode::Json, b"[{},{}]", &["1", r#""b""#]);
+        assert_eq!(
+            parse(&body),
+            json!([internal_error(json!(1)), internal_error(json!("b"))])
+        );
+
+        // SSE: one event per list request.
+        let (body, _, _) = refused(BodyMode::Sse, b"data: [{},{}]\n\n", &["1", "2"]);
+        let events: Vec<Value> = body
+            .split("\n\n")
+            .filter(|event| !event.is_empty())
+            .map(|event| {
+                parse(
+                    event
+                        .strip_prefix("event: message\ndata: ")
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            events,
+            vec![internal_error(json!(1)), internal_error(json!(2))]
+        );
+        assert!(body.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn a_kept_body_only_gets_no_store() {
+        let changes = HeaderChanges::no_store();
+        assert!(changes.remove.is_empty(), "validators still match");
+        assert_eq!(changes.set, vec![("cache-control", "no-store".to_owned())]);
+    }
+
+    #[test]
+    fn an_incomplete_response_marks_the_catalog_stale() {
+        let config = Config::from_json(b"{}").unwrap_or_else(|err| unreachable!("{err}"));
+        let mut catalogs = Catalogs::new(
+            MemoryStore::default(),
+            CatalogSettings::from_config(&config),
+            "index".to_owned(),
+        );
+        let read = Pin {
+            class: Class::Read,
+            source: Source::Annotations,
+        };
+        catalogs.record_success("k", 100, &[("search", read)]);
+        let pending = Pending {
+            ids: Vec::new(),
+            caller: Caller::new(&config, BTreeSet::new()),
+            key: Ok("k".to_owned()),
+        };
+        let mut reasons = Vec::new();
+        let mut log = |event: &Event<'_>, catalog: Option<&str>| {
+            if let Event::CatalogStale(reason) = event {
+                reasons.push((reason.as_str(), catalog.map(str::to_owned)));
+            }
+        };
+        let mut env = Env {
+            config: &config,
+            catalogs: &mut catalogs,
+            now_ms: 200,
+            log: &mut log,
+        };
+        on_incomplete(&pending, &mut env);
+        let catalog = catalogs.read("k");
+        assert!(catalog.is_stale(200, 0));
+        assert_eq!(catalog.pin("search"), Some(read), "pins are kept");
+        assert_eq!(reasons, vec![("incomplete", Some("k".to_owned()))]);
     }
 }

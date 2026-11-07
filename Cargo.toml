@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 [package]
 name = "mcp_tool_annotation_guard"
-version = "1.0.0"
+version = "1.0.1"
 rust-version = "1.88.0"
 edition = "2018"
 resolver = "2"
@@ -15,10 +15,6 @@ license = "Apache-2.0"
 group_id = "98acbdb3-4e1e-40b3-a8eb-f451a67a154b"
 definition_asset_id = "mcp-tool-annotation-guard"
 implementation_asset_id = "mcp-tool-annotation-guard-flex"
-
-# Minimum Omni Gateway runtime: stop iteration needs >= 1.11.4.
-[package.metadata.flex]
-min-version = "1.11.4"
 
 [dependencies]
 pdk = { version = "1.10.0", features = ["enable_stop_iteration"] }

@@ -12,6 +12,10 @@
 //! safe direction for both uses of IDs: duplicate detection in batches finds
 //! more duplicates, and list responses re-serialised by the server are still
 //! recognised.
+//!
+//! [`may_answer`] is looser still, for the one place where a missed match is
+//! the unsafe direction: finding responses a client could read that the guard
+//! does not filter.
 
 use std::hash::{Hash, Hasher};
 
@@ -71,6 +75,72 @@ impl Id {
     pub fn raw(&self) -> &str {
         &self.raw
     }
+
+    /// The finite number a JavaScript client converts this ID to with
+    /// `Number(id)`, if any.
+    fn number(&self) -> Option<f64> {
+        match &self.key {
+            Key::Int(digits) => digits.parse::<f64>().ok().filter(|n| n.is_finite()),
+            Key::Str(text) => js_number(text),
+        }
+    }
+}
+
+/// Whether some client could take a message whose `id` is the raw JSON value
+/// `raw` for a response to one of `expected`: the same ID, or a string or
+/// number that converts to the same number. The MCP TypeScript SDK, for
+/// example, looks responses up by `Number(id)`, so `"1"`, `1.0`, `1e0` and
+/// `"0x1"` all answer the request with ID `1`.
+pub fn may_answer(raw: &str, expected: &[Id]) -> bool {
+    let number = match Id::from_raw(raw) {
+        IdToken::Valid(id) if expected.contains(&id) => return true,
+        IdToken::Valid(id) => id.number(),
+        IdToken::Invalid => json_number(raw),
+        IdToken::Null => None,
+    };
+    number.is_some_and(|n| expected.iter().any(|id| id.number() == Some(n)))
+}
+
+/// A JSON number token (fraction or exponent allowed) as a finite number.
+fn json_number(raw: &str) -> Option<f64> {
+    let token = raw.trim_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\r'));
+    match token.as_bytes().first() {
+        Some(b'-' | b'0'..=b'9') => serde_json::from_str::<f64>(token)
+            .ok()
+            .filter(|n| n.is_finite()),
+        _ => None,
+    }
+}
+
+/// JavaScript's `Number(text)`, when the result is finite: surrounding white
+/// space removed, empty is 0, `0x`/`0o`/`0b` prefixes, then a decimal literal.
+/// White space is taken broadly, which can only match more IDs.
+fn js_number(text: &str) -> Option<f64> {
+    let text = text.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
+    if text.is_empty() {
+        return Some(0.0);
+    }
+    let radix = match text.get(..2) {
+        Some("0x" | "0X") => Some(16),
+        Some("0o" | "0O") => Some(8),
+        Some("0b" | "0B") => Some(2),
+        _ => None,
+    };
+    if let Some(radix) = radix {
+        let digits = text.get(2..).filter(|d| !d.is_empty())?;
+        let mut value = 0.0_f64;
+        for c in digits.chars() {
+            value = value * f64::from(radix) + f64::from(c.to_digit(radix)?);
+        }
+        return Some(value).filter(|n| n.is_finite());
+    }
+    if !text
+        .bytes()
+        .all(|b| matches!(b, b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-'))
+    {
+        return None;
+    }
+    text.parse::<f64>().ok().filter(|n| n.is_finite())
 }
 
 /// Returns the comparison key for a JSON integer token, or `None` if the
@@ -185,5 +255,36 @@ mod tests {
         assert!(set.insert(valid("1")));
         assert!(!set.insert(valid("1")));
         assert!(set.insert(valid(r#""1""#)));
+    }
+
+    #[test]
+    fn ids_a_client_converts_to_the_same_number_may_answer() {
+        let one = [valid("1")];
+        for raw in [
+            "1", r#""1""#, "1.0", "1e0", "10e-1", r#""0x1""#, r#""0b1""#, r#""0o1""#, r#"" 1 ""#,
+            r#""+1""#, r#""1.""#,
+        ] {
+            assert!(may_answer(raw, &one), "{raw}");
+        }
+        for raw in [
+            "2",
+            r#""2""#,
+            "1.5",
+            r#""1a""#,
+            r#""-0x1""#,
+            r#""Infinity""#,
+            "true",
+            "null",
+            "[1]",
+            r#"{"id":1}"#,
+            "1e400",
+        ] {
+            assert!(!may_answer(raw, &one), "{raw}");
+        }
+        assert!(may_answer(r#""""#, &[valid("0")]), "Number(\"\") is 0");
+        assert!(may_answer("-0.0", &[valid("0")]));
+        assert!(may_answer("1", &[valid(r#""1""#)]), "a numeric string id");
+        assert!(may_answer(r#""abc""#, &[valid(r#""abc""#)]));
+        assert!(!may_answer(r#""ABC""#, &[valid(r#""abc""#)]));
     }
 }

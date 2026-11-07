@@ -21,11 +21,9 @@
 //! the providers themselves.
 
 mod common;
+#[path = "common/jwt.rs"]
+mod jwt;
 
-use std::process::Command;
-
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
 use httpmock::{Method::POST, MockServer};
 use pdk_test::port::Port;
 use pdk_test::services::flex::{ApiConfig, Flex, FlexConfig, PolicyConfig};
@@ -34,8 +32,8 @@ use pdk_test::{pdk_test, TestComposite};
 use serde_json::{json, Value};
 
 use common::*;
+use jwt::{claims, jwt_validation, now, SigningKey};
 
-const AUDIENCE: &str = "guard-idp-test";
 const ALLOWED_RESULT: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"content":[]}}"#;
 
 /// One provider token shape.
@@ -152,108 +150,8 @@ fn cases() -> Vec<Case> {
     ]
 }
 
-struct SigningKey {
-    dir: std::path::PathBuf,
-    public_pem: String,
-}
-
-impl SigningKey {
-    fn generate() -> Self {
-        Self::generate_named("signing")
-    }
-
-    fn generate_named(name: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("guard-idp-{}-{name}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let private = dir.join("private.pem");
-        let public = dir.join("public.pem");
-        run(
-            "openssl",
-            &["genrsa", "-out", private.to_str().unwrap(), "2048"],
-        );
-        run(
-            "openssl",
-            &[
-                "rsa",
-                "-in",
-                private.to_str().unwrap(),
-                "-pubout",
-                "-out",
-                public.to_str().unwrap(),
-            ],
-        );
-        let public_pem = std::fs::read_to_string(&public).unwrap();
-        Self { dir, public_pem }
-    }
-
-    fn sign(&self, claims: &Value) -> String {
-        let header = URL_SAFE_NO_PAD.encode(json!({"alg": "RS256", "typ": "JWT"}).to_string());
-        let payload = URL_SAFE_NO_PAD.encode(claims.to_string());
-        let input = format!("{header}.{payload}");
-        let input_file = self.dir.join("input");
-        std::fs::write(&input_file, &input).unwrap();
-        let output = Command::new("openssl")
-            .args(["dgst", "-sha256", "-sign"])
-            .arg(self.dir.join("private.pem"))
-            .arg(&input_file)
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "openssl dgst failed");
-        format!("{input}.{}", URL_SAFE_NO_PAD.encode(output.stdout))
-    }
-}
-
-impl Drop for SigningKey {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
-
-fn run(program: &str, args: &[&str]) {
-    let output = Command::new(program).args(args).output().unwrap();
-    assert!(
-        output.status.success(),
-        "{program} {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-fn now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-}
-
 fn call(tool: &str) -> String {
     json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool, "arguments": {}}}).to_string()
-}
-
-fn jwt_validation(public_pem: &str) -> PolicyConfig {
-    // Same settings as the Connected gateway check, with a static key.
-    PolicyConfig::builder()
-        .name("jwt-validation-flex")
-        .configuration(json!({
-            "jwtOrigin": "httpBearerAuthenticationHeader",
-            "jwtExpression": "#[attributes.headers['jwt']]",
-            "signingMethod": "rsa",
-            "signingKeyLength": 256,
-            "jwtKeyOrigin": "text",
-            "textKey": public_pem,
-            "customKeyExpression": "#[authentication.properties['key_to_your_public_pem_certificate']]",
-            "jwksUrl": "http://your-jwks-service.example:80/base/path",
-            "jwksServiceTimeToLive": 60,
-            "jwksServiceConnectionTimeout": 10000,
-            "skipClientIdValidation": true,
-            "clientIdExpression": "#[vars.claimSet.client_id]",
-            "validateAudClaim": true,
-            "mandatoryAudClaim": true,
-            "supportedAudiences": AUDIENCE,
-            "mandatoryExpClaim": true,
-            "mandatoryNbfClaim": false,
-            "validateCustomClaim": false
-        }))
-        .build()
 }
 
 fn guard(case: &Case) -> PolicyConfig {
@@ -269,16 +167,6 @@ fn guard(case: &Case) -> PolicyConfig {
         .name(POLICY_NAME)
         .configuration(config)
         .build()
-}
-
-/// Valid registered claims plus the provider-specific ones.
-fn claims(extra: &Value) -> Value {
-    let mut claims =
-        json!({"iss": "https://idp.example", "sub": "user-1", "aud": AUDIENCE, "exp": now() + 600});
-    for (k, v) in extra.as_object().unwrap() {
-        claims[k] = v.clone();
-    }
-    claims
 }
 
 async fn send(

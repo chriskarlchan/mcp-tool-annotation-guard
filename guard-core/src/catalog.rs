@@ -3,23 +3,31 @@
 //! Monotonic pins and the catalog store behind a `Store` trait.
 //!
 //! A [`Catalog`] maps tool names to pins plus two freshness timestamps.
-//! [`Catalogs`] keeps a worker-local copy of each catalog and a shared copy in
-//! a [`Store`] (the PDK cache in the policy crate). Merging is a per-tool
-//! `max`, a union of tools and a `max` of each timestamp, so it is
+//! [`Catalogs`] keeps a shared copy of each catalog in a [`Store`] (local
+//! Data Storage in the policy crate) and a worker-local copy. Merging is a
+//! per-tool `max`, a union of tools and a `max` of each timestamp, so it is
 //! commutative, associative and idempotent below capacity, and repeated
 //! merges converge.
 //!
 //! Design choices:
+//! - Every write to the shared copy is a compare-and-swap of a merge with
+//!   the current shared copy, so a write only ever adds to it: no pin and no
+//!   failure is lost to a concurrent write.
+//! - Nothing is evicted. A shared index lists the catalogs of one API
+//!   instance and configuration; once it holds `limits.maxCatalogs`
+//!   catalogs, a new catalog is refused and its tools stay unknown.
 //! - Capacity also applies when merging copies: tools already in the copy
 //!   being merged into are kept, and the other copy's new tools are added in
 //!   name order until a limit is reached (existing pins are never evicted).
-//!   At capacity, merging is therefore no longer commutative.
-//! - Worker-local copies are bounded by `limits.maxCatalogs` too, evicting
-//!   the least recently used copy.
+//!   At capacity, merging is therefore no longer commutative. The shared
+//!   copy is always the copy merged into, so every worker keeps the same
+//!   pins.
+//! - A shared copy that cannot be read completely (another encoding) is
+//!   never overwritten.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::rc::Rc;
 
@@ -52,6 +60,8 @@ pub struct CatalogLimits {
 pub enum CapacityLimit {
     MaxCachedTools,
     MaxCatalogBytes,
+    /// The catalog itself was refused.
+    MaxCatalogs,
 }
 
 impl CapacityLimit {
@@ -59,6 +69,7 @@ impl CapacityLimit {
         match self {
             CapacityLimit::MaxCachedTools => "maxCachedTools",
             CapacityLimit::MaxCatalogBytes => "maxCatalogBytes",
+            CapacityLimit::MaxCatalogs => "maxCatalogs",
         }
     }
 }
@@ -208,6 +219,16 @@ impl Catalog {
     /// encoding version, is `None` (treated as no shared copy). Entries with
     /// an unknown pin code are skipped.
     pub fn decode(bytes: &[u8]) -> Option<Catalog> {
+        Catalog::decode_with(bytes, false)
+    }
+
+    /// Like [`Catalog::decode`], but `None` when any entry is unreadable:
+    /// only a copy read completely may be rewritten.
+    fn decode_complete(bytes: &[u8]) -> Option<Catalog> {
+        Catalog::decode_with(bytes, true)
+    }
+
+    fn decode_with(bytes: &[u8], complete: bool) -> Option<Catalog> {
         let wire: WireIn = serde_json::from_slice(bytes).ok()?;
         if wire.v != ENCODING_VERSION {
             return None;
@@ -220,9 +241,13 @@ impl Catalog {
             ..Catalog::default()
         };
         for (name, code) in wire.t {
-            if let Some(pin) = pin_from_code(&code) {
-                catalog.tools_len += entry_len(&name);
-                catalog.tools.insert(name, pin);
+            match pin_from_code(&code) {
+                Some(pin) => {
+                    catalog.tools_len += entry_len(&name);
+                    catalog.tools.insert(name, pin);
+                }
+                None if complete => return None,
+                None => {}
             }
         }
         Some(catalog)
@@ -325,49 +350,173 @@ pub fn partition_key(config: &Config, value: Option<&str>) -> Result<String, Par
     }
 }
 
+/// Prefix of every key the guard stores.
+const KEY_PREFIX: &str = "mtag1:";
+
 /// The store key for `(apiInstanceKey, configFingerprint, partitionKey)`.
 /// The two hashes have fixed lengths and come first, so the free-form API
 /// instance key cannot make two keys collide.
 pub fn catalog_key(api_instance: &str, fingerprint: &str, partition: &str) -> String {
-    format!("mtag1:{fingerprint}:{partition}:{api_instance}")
+    format!("{KEY_PREFIX}{fingerprint}:{partition}:{api_instance}")
+}
+
+/// The key of the index that lists the catalogs of one API instance and
+/// configuration. A catalog key's partition is empty or 32 hex digits, so an
+/// index key is never a catalog key.
+pub fn index_key(api_instance: &str, fingerprint: &str) -> String {
+    format!("{KEY_PREFIX}{fingerprint}:index:{api_instance}")
+}
+
+/// `true` for a catalog or index key of `api_instance` under another
+/// configuration fingerprint.
+fn is_other_configuration(key: &str, api_instance: &str, fingerprint: &str) -> bool {
+    let Some((key_fingerprint, rest)) = key
+        .strip_prefix(KEY_PREFIX)
+        .and_then(|rest| rest.split_once(':'))
+    else {
+        return false;
+    };
+    let Some((_, key_api_instance)) = rest.split_once(':') else {
+        return false;
+    };
+    key_fingerprint != fingerprint && key_api_instance == api_instance
+}
+
+/// Deletes the catalogs and the index that an earlier configuration of
+/// `api_instance` left in the store. Best effort: returns how many keys were
+/// deleted.
+pub fn remove_other_configurations<S: Store>(
+    store: &S,
+    api_instance: &str,
+    fingerprint: &str,
+) -> usize {
+    store
+        .keys()
+        .iter()
+        .filter(|key| is_other_configuration(key, api_instance, fingerprint))
+        .filter(|key| store.delete(key).is_ok())
+        .count()
+}
+
+#[derive(Serialize)]
+struct IndexOut<'a> {
+    v: u8,
+    k: &'a BTreeSet<String>,
+}
+
+#[derive(Deserialize)]
+struct IndexIn {
+    v: u8,
+    k: BTreeSet<String>,
+}
+
+fn encode_index(keys: &BTreeSet<String>) -> Vec<u8> {
+    serde_json::to_vec(&IndexOut {
+        v: ENCODING_VERSION,
+        k: keys,
+    })
+    .unwrap_or_default()
+}
+
+fn decode_index(bytes: &[u8]) -> Option<BTreeSet<String>> {
+    let wire: IndexIn = serde_json::from_slice(bytes).ok()?;
+    (wire.v == ENCODING_VERSION).then_some(wire.k)
 }
 
 // --- stores -----------------------------------------------------------------------
 
-/// A save that the store did not accept.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct StoreError;
+/// The version of a stored value, for compare-and-swap.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Version(pub String);
 
-/// The shared store (the PDK cache in the policy crate). It offers no atomic
-/// operations, and a save may overwrite a concurrent save.
+/// What a save expects to replace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Expect<'a> {
+    /// No value is stored.
+    Absent,
+    /// The value read at this version, unchanged since.
+    Version(&'a Version),
+}
+
+/// An operation the store did not complete.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreError {
+    /// The stored value is not the one the save expected.
+    Conflict,
+    /// Any other failure.
+    Failed,
+}
+
+/// The shared store (local Data Storage in the policy crate). Every save is
+/// a compare-and-swap.
 pub trait Store {
-    fn get(&self, key: &str) -> Option<Vec<u8>>;
-    fn save(&self, key: &str, value: Vec<u8>) -> Result<(), StoreError>;
+    fn get(&self, key: &str) -> Result<Option<(Vec<u8>, Version)>, StoreError>;
+    fn save(&self, key: &str, value: Vec<u8>, expected: Expect<'_>) -> Result<(), StoreError>;
+    /// Every key in the store, best effort (empty if unknown).
+    fn keys(&self) -> Vec<String>;
+    fn delete(&self, key: &str) -> Result<(), StoreError>;
 }
 
 impl<T: Store + ?Sized> Store for Rc<T> {
-    fn get(&self, key: &str) -> Option<Vec<u8>> {
+    fn get(&self, key: &str) -> Result<Option<(Vec<u8>, Version)>, StoreError> {
         (**self).get(key)
     }
 
-    fn save(&self, key: &str, value: Vec<u8>) -> Result<(), StoreError> {
-        (**self).save(key, value)
+    fn save(&self, key: &str, value: Vec<u8>, expected: Expect<'_>) -> Result<(), StoreError> {
+        (**self).save(key, value, expected)
+    }
+
+    fn keys(&self) -> Vec<String> {
+        (**self).keys()
+    }
+
+    fn delete(&self, key: &str) -> Result<(), StoreError> {
+        (**self).delete(key)
     }
 }
 
-/// An in-memory [`Store`] for tests and host-side tools.
+/// An in-memory [`Store`] for tests and host-side tools. Like the gateway's
+/// shared data, it only checks a version against a stored value: a save with
+/// a version to a key that was deleted since stores it again.
 #[derive(Debug, Default)]
 pub struct MemoryStore {
-    entries: RefCell<HashMap<String, Vec<u8>>>,
+    entries: RefCell<HashMap<String, (Vec<u8>, u64)>>,
+    last_version: Cell<u64>,
 }
 
 impl Store for MemoryStore {
-    fn get(&self, key: &str) -> Option<Vec<u8>> {
-        self.entries.borrow().get(key).cloned()
+    fn get(&self, key: &str) -> Result<Option<(Vec<u8>, Version)>, StoreError> {
+        Ok(self
+            .entries
+            .borrow()
+            .get(key)
+            .map(|(value, version)| (value.clone(), Version(version.to_string()))))
     }
 
-    fn save(&self, key: &str, value: Vec<u8>) -> Result<(), StoreError> {
-        self.entries.borrow_mut().insert(key.to_owned(), value);
+    fn save(&self, key: &str, value: Vec<u8>, expected: Expect<'_>) -> Result<(), StoreError> {
+        let mut entries = self.entries.borrow_mut();
+        let current = entries.get(key).map(|(_, version)| version.to_string());
+        let matches = match expected {
+            Expect::Absent => current.is_none(),
+            Expect::Version(version) => current
+                .as_deref()
+                .is_none_or(|current| current == version.0.as_str()),
+        };
+        if !matches {
+            return Err(StoreError::Conflict);
+        }
+        let version = self.last_version.get().saturating_add(1);
+        self.last_version.set(version);
+        entries.insert(key.to_owned(), (value, version));
+        Ok(())
+    }
+
+    fn keys(&self) -> Vec<String> {
+        self.entries.borrow().keys().cloned().collect()
+    }
+
+    fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.entries.borrow_mut().remove(key);
         Ok(())
     }
 }
@@ -379,8 +528,8 @@ pub struct CatalogSettings {
     pub limits: CatalogLimits,
     /// `catalog.maxAgeSeconds`.
     pub max_age_seconds: u64,
-    /// Bound for worker-local copies (`limits.maxCatalogs`).
-    pub max_local_catalogs: usize,
+    /// `limits.maxCatalogs`: catalogs per API instance and configuration.
+    pub max_catalogs: usize,
 }
 
 impl CatalogSettings {
@@ -391,13 +540,13 @@ impl CatalogSettings {
                 max_catalog_bytes: config.limits.max_catalog_bytes,
             },
             max_age_seconds: config.catalog_max_age_seconds,
-            max_local_catalogs: config.limits.max_catalogs,
+            max_catalogs: config.limits.max_catalogs,
         }
     }
 }
 
-/// Attempts of the write-verify loop.
-pub const WRITE_ATTEMPTS: usize = 3;
+/// Attempts of each compare-and-swap loop.
+pub const WRITE_ATTEMPTS: usize = 8;
 
 /// What a write did, for logging.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -410,31 +559,54 @@ pub struct WriteReport {
     pub became_stale: bool,
     /// `catalog_fresh`: the catalog was stale before this write and is fresh now.
     pub became_fresh: bool,
-    /// `catalog_merge_retry_exhausted`: the shared copy still lacks something.
+    /// `catalog_merge_retry_exhausted`: the write is kept by this worker only.
     pub retry_exhausted: bool,
 }
 
-#[derive(Debug, Default)]
-struct LocalEntry {
-    catalog: Catalog,
-    last_used: u64,
+/// The shared copy of a catalog, as read.
+enum Shared {
+    Absent,
+    Present(Catalog, Version),
+    /// The read failed, or the copy could not be read (completely, when
+    /// writing). It is never overwritten.
+    Unusable,
+}
+
+/// The index's answer to a new catalog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Admission {
+    Admitted,
+    /// `limits.maxCatalogs` reached.
+    Full,
+    /// The index could not be read or updated.
+    Failed,
 }
 
 /// Worker-local copies plus the shared store (two layers).
 pub struct Catalogs<S> {
     store: S,
     settings: CatalogSettings,
-    local: HashMap<String, LocalEntry>,
-    tick: u64,
+    /// See [`index_key`].
+    index_key: String,
+    /// Never evicted. Holds catalogs from the shared store, which the index
+    /// bounds, plus at most `limits.maxCatalogs` copies the store did not
+    /// accept.
+    local: HashMap<String, Catalog>,
+    /// Keys of local copies taken from, or saved to, the shared store.
+    from_shared: HashSet<String>,
+    /// Returned for a catalog that does not exist.
+    empty: Catalog,
 }
 
 impl<S: Store> Catalogs<S> {
-    pub fn new(store: S, settings: CatalogSettings) -> Catalogs<S> {
+    pub fn new(store: S, settings: CatalogSettings, index_key: String) -> Catalogs<S> {
         Catalogs {
             store,
             settings,
+            index_key,
             local: HashMap::new(),
-            tick: 0,
+            from_shared: HashSet::new(),
+            empty: Catalog::default(),
         }
     }
 
@@ -442,33 +614,52 @@ impl<S: Store> Catalogs<S> {
         self.settings
     }
 
-    /// Read path (`tools/call`): merges the shared copy into the local copy
-    /// and returns the local copy, which therefore only ever gains knowledge.
+    /// Read path (`tools/call`): the shared copy, with this worker's copy
+    /// merged into it. This worker's copy is replaced by the result, so it
+    /// only ever gains knowledge.
     pub fn read(&mut self, key: &str) -> &Catalog {
         let limits = self.settings.limits;
-        let shared = self.load_shared(key);
-        let local = self.local_entry(key);
-        if let Some(shared) = shared {
-            local.merge(&shared, limits);
+        let shared = self.load(key, Catalog::decode);
+        self.note_shared(key, &shared);
+        if let Shared::Present(mut view, _) = shared {
+            let local = self.local.entry(key.to_owned()).or_default();
+            view.merge(local, limits);
+            *local = view;
+            return local;
         }
-        local
+        self.local.get(key).unwrap_or(&self.empty)
+    }
+
+    /// A shared copy disappears only when a configuration change removes it.
+    /// A local copy taken from it is then dropped as well, so this worker
+    /// starts over like every other worker instead of deciding with pins
+    /// older than the ones they saw.
+    fn note_shared(&mut self, key: &str, shared: &Shared) {
+        match shared {
+            Shared::Present(..) => {
+                if !self.from_shared.contains(key) {
+                    self.from_shared.insert(key.to_owned());
+                }
+            }
+            Shared::Absent => {
+                if self.from_shared.remove(key) {
+                    self.local.remove(key);
+                }
+            }
+            Shared::Unusable => {}
+        }
     }
 
     /// Write path after a list response was fully validated and processed:
-    /// merge the candidates, set `lastSuccessAt`, then write-verify.
+    /// merge the candidates, set `lastSuccessAt`, then write to the shared copy.
     pub fn record_success(
         &mut self,
         key: &str,
         now_ms: u64,
         observations: &[(&str, Pin)],
     ) -> WriteReport {
-        self.write(key, now_ms, |catalog, limits| {
-            let changes: Vec<PinChange> = observations
-                .iter()
-                .map(|(name, pin)| catalog.observe(name, *pin, limits))
-                .collect();
+        self.write(key, now_ms, observations, |catalog| {
             catalog.mark_success(now_ms);
-            changes
         })
     }
 
@@ -483,22 +674,16 @@ impl<S: Store> Catalogs<S> {
         now_ms: u64,
         observations: &[(&str, Pin)],
     ) -> WriteReport {
-        self.write(key, now_ms, |catalog, limits| {
-            let changes: Vec<PinChange> = observations
-                .iter()
-                .map(|(name, pin)| catalog.observe(name, *pin, limits))
-                .collect();
+        self.write(key, now_ms, observations, |catalog| {
             catalog.mark_success(now_ms);
             catalog.mark_failure(now_ms);
-            changes
         })
     }
 
     /// Write path after a list response could not be inspected.
     pub fn record_failure(&mut self, key: &str, now_ms: u64) -> WriteReport {
-        self.write(key, now_ms, |catalog, _| {
+        self.write(key, now_ms, &[], |catalog| {
             catalog.mark_failure(now_ms);
-            Vec::new()
         })
     }
 
@@ -506,79 +691,187 @@ impl<S: Store> Catalogs<S> {
         &mut self,
         key: &str,
         now_ms: u64,
-        update: impl FnOnce(&mut Catalog, CatalogLimits) -> Vec<PinChange>,
+        observations: &[(&str, Pin)],
+        mark: impl FnOnce(&mut Catalog),
     ) -> WriteReport {
         let settings = self.settings;
-        let shared = self.load_shared(key);
-        let local = self.local_entry(key);
-        if let Some(shared) = shared {
-            local.merge(&shared, settings.limits);
+        let shared = self.load(key, Catalog::decode_complete);
+        self.note_shared(key, &shared);
+        let mut admitted = false;
+        let mut save_shared = true;
+        if !matches!(shared, Shared::Present(..)) {
+            let admission = match shared {
+                Shared::Absent => self.admit(key),
+                _ => Admission::Failed,
+            };
+            admitted = admission == Admission::Admitted;
+            let has_local = self.local.contains_key(key);
+            let local_only_full = !has_local && self.local.len() >= settings.max_catalogs;
+            if admission == Admission::Full || (admission == Admission::Failed && local_only_full) {
+                if !has_local {
+                    // Refused: no catalog is created and its tools stay unknown.
+                    return WriteReport {
+                        changes: observations
+                            .iter()
+                            .map(|_| PinChange::NotPinned(CapacityLimit::MaxCatalogs))
+                            .collect(),
+                        capacity: Some(CapacityLimit::MaxCatalogs),
+                        ..WriteReport::default()
+                    };
+                }
+                // This worker already decides with a copy the store never
+                // accepted: keep it current here, so its pins still rise and
+                // its failures still count.
+                save_shared = false;
+            }
         }
-        let was_stale = local.is_stale(now_ms, settings.max_age_seconds);
-        let changes = update(local, settings.limits);
-        let is_stale = local.is_stale(now_ms, settings.max_age_seconds);
-        let wanted = local.clone();
 
-        let capacity = changes.iter().find_map(|change| match change {
+        let mut view = match &shared {
+            Shared::Present(catalog, _) => catalog.clone(),
+            Shared::Absent | Shared::Unusable => Catalog::default(),
+        };
+        if let Some(local) = self.local.get(key) {
+            view.merge(local, settings.limits);
+        }
+        let was_stale = view.is_stale(now_ms, settings.max_age_seconds);
+        let mut changes: Vec<PinChange> = observations
+            .iter()
+            .map(|(name, pin)| view.observe(name, *pin, settings.limits))
+            .collect();
+        mark(&mut view);
+        let mut capacity = changes.iter().find_map(|change| match change {
             PinChange::NotPinned(limit) => Some(*limit),
             _ => None,
         });
-        let verified = self.write_verify(key, &wanted);
+
+        let mut retry_exhausted = false;
+        let kept = if !save_shared {
+            capacity = capacity.or(Some(CapacityLimit::MaxCatalogs));
+            retry_exhausted = true;
+            view
+        } else {
+            match self.commit(key, &view, shared, admitted) {
+                Some((catalog, refused)) => {
+                    if !self.from_shared.contains(key) {
+                        self.from_shared.insert(key.to_owned());
+                    }
+                    capacity = capacity.or(refused);
+                    catalog
+                }
+                None => {
+                    retry_exhausted = true;
+                    view
+                }
+            }
+        };
+
+        // Report on the copy that is kept, which may hold other workers'
+        // changes and may lack tools the shared copy had no room for.
+        if let Some(limit) = capacity {
+            for ((name, _), change) in observations.iter().zip(changes.iter_mut()) {
+                if kept.pin(name).is_none() {
+                    *change = PinChange::NotPinned(limit);
+                }
+            }
+        }
+        let is_stale = kept.is_stale(now_ms, settings.max_age_seconds);
+        self.local.insert(key.to_owned(), kept);
         WriteReport {
             changes,
             capacity,
             became_stale: !was_stale && is_stale,
             became_fresh: was_stale && !is_stale,
-            retry_exhausted: !verified,
+            retry_exhausted,
         }
     }
 
-    /// Read, merge, save, re-read; retry while the re-read copy lacks
-    /// something of `wanted`. Returns `true` once verified.
-    fn write_verify(&mut self, key: &str, wanted: &Catalog) -> bool {
+    /// Compare-and-swap loop: merges `wanted` into the shared copy. Returns
+    /// the saved copy and the limit that kept some of `wanted` out of it, or
+    /// `None` if the shared copy could not be written.
+    fn commit(
+        &self,
+        key: &str,
+        wanted: &Catalog,
+        first: Shared,
+        mut admitted: bool,
+    ) -> Option<(Catalog, Option<CapacityLimit>)> {
         let limits = self.settings.limits;
+        let mut first = Some(first);
         for _ in 0..WRITE_ATTEMPTS {
-            let mut merged = self.load_shared(key).unwrap_or_default();
-            merged.merge(wanted, limits);
-            let saved = self.store.save(key, merged.encode()).is_ok();
-            if let Some(reread) = self.load_shared(key) {
-                let verified = saved && reread.contains(wanted);
-                self.local_entry(key).merge(&reread, limits);
-                if verified {
-                    return true;
+            let shared = first
+                .take()
+                .unwrap_or_else(|| self.load(key, Catalog::decode_complete));
+            let (base, version) = match shared {
+                Shared::Unusable => return None,
+                Shared::Absent => {
+                    if !admitted && self.admit(key) != Admission::Admitted {
+                        return None;
+                    }
+                    admitted = true;
+                    (Catalog::default(), None)
                 }
+                Shared::Present(catalog, version) => (catalog, Some(version)),
+            };
+            if base.contains(wanted) {
+                return Some((base, None));
+            }
+            let mut merged = base;
+            let refused = merged.merge(wanted, limits);
+            let expected = version.as_ref().map_or(Expect::Absent, Expect::Version);
+            match self.store.save(key, merged.encode(), expected) {
+                Ok(()) => return Some((merged, refused)),
+                Err(StoreError::Conflict) => {}
+                Err(StoreError::Failed) => return None,
             }
         }
-        false
+        None
     }
 
-    fn load_shared(&self, key: &str) -> Option<Catalog> {
-        self.store
-            .get(key)
-            .and_then(|bytes| Catalog::decode(&bytes))
-    }
-
-    fn local_entry(&mut self, key: &str) -> &mut Catalog {
-        self.tick += 1;
-        let tick = self.tick;
-        if !self.local.contains_key(key) && self.local.len() >= self.settings.max_local_catalogs {
-            let oldest = self
-                .local
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_used)
-                .map(|(k, _)| k.clone());
-            if let Some(oldest) = oldest {
-                self.local.remove(&oldest);
+    /// Adds `key` to the index unless the index is full (compare-and-swap).
+    fn admit(&self, key: &str) -> Admission {
+        for _ in 0..WRITE_ATTEMPTS {
+            let (mut keys, version) = match self.store.get(&self.index_key) {
+                Err(_) => return Admission::Failed,
+                Ok(None) => (BTreeSet::new(), None),
+                Ok(Some((bytes, version))) => match decode_index(&bytes) {
+                    Some(keys) => (keys, Some(version)),
+                    None => return Admission::Failed,
+                },
+            };
+            if keys.contains(key) {
+                return Admission::Admitted;
+            }
+            if keys.len() >= self.settings.max_catalogs {
+                return Admission::Full;
+            }
+            keys.insert(key.to_owned());
+            let expected = version.as_ref().map_or(Expect::Absent, Expect::Version);
+            match self
+                .store
+                .save(&self.index_key, encode_index(&keys), expected)
+            {
+                Ok(()) => return Admission::Admitted,
+                Err(StoreError::Conflict) => {}
+                Err(StoreError::Failed) => return Admission::Failed,
             }
         }
-        let entry = self.local.entry(key.to_owned()).or_default();
-        entry.last_used = tick;
-        &mut entry.catalog
+        Admission::Failed
+    }
+
+    fn load(&self, key: &str, decode: fn(&[u8]) -> Option<Catalog>) -> Shared {
+        match self.store.get(key) {
+            Ok(None) => Shared::Absent,
+            Ok(Some((bytes, version))) => match decode(&bytes) {
+                Some(catalog) => Shared::Present(catalog, version),
+                None => Shared::Unusable,
+            },
+            Err(_) => Shared::Unusable,
+        }
     }
 
     /// The local copy, if this worker has one (for tests and diagnostics).
     pub fn local_copy(&self, key: &str) -> Option<&Catalog> {
-        self.local.get(key).map(|entry| &entry.catalog)
+        self.local.get(key)
     }
 }
 
@@ -596,7 +889,7 @@ mod tests {
     const SETTINGS: CatalogSettings = CatalogSettings {
         limits: BIG,
         max_age_seconds: 0,
-        max_local_catalogs: 10,
+        max_catalogs: 10,
     };
 
     fn pin(class: Class) -> Pin {
@@ -873,38 +1166,152 @@ mod tests {
 
     // --- local + shared -----------------------------------------------------------
 
-    /// Simulates another worker overwriting the shared copy with a stale
-    /// value right after each of our saves.
+    const INDEX: &str = "index";
+
+    fn worker<S: Store>(store: S) -> Catalogs<S> {
+        Catalogs::new(store, SETTINGS, INDEX.to_owned())
+    }
+
+    fn worker_with<S: Store>(store: S, settings: CatalogSettings) -> Catalogs<S> {
+        Catalogs::new(store, settings, INDEX.to_owned())
+    }
+
+    fn shared<S: Store>(store: &S, key: &str) -> Option<Catalog> {
+        let (bytes, _) = store.get(key).ok().flatten()?;
+        Catalog::decode(&bytes)
+    }
+
+    fn raw<S: Store>(store: &S, key: &str) -> Option<Vec<u8>> {
+        store.get(key).ok().flatten().map(|(bytes, _)| bytes)
+    }
+
+    /// Writes `value` whatever is stored (another worker's committed save).
+    fn put(store: &MemoryStore, key: &str, value: Vec<u8>) {
+        let current = store.get(key).ok().flatten().map(|(_, version)| version);
+        let expected = current.as_ref().map_or(Expect::Absent, Expect::Version);
+        let saved = store.save(key, value, expected);
+        assert_eq!(saved, Ok(()));
+    }
+
+    type OtherWrite = Box<dyn Fn(Option<Vec<u8>>) -> Vec<u8>>;
+
+    /// Simulates other workers: right before our next save to a queued key,
+    /// another worker commits its own save there, computed from the value
+    /// stored at that moment. Our save, which read the earlier version, then
+    /// conflicts.
     #[derive(Default)]
     struct RacingStore {
         inner: MemoryStore,
-        clobbers: RefCell<VecDeque<Vec<u8>>>,
+        others: RefCell<VecDeque<(String, OtherWrite)>>,
+        before: RefCell<Option<(String, BeforeSave)>>,
+    }
+
+    type BeforeSave = Box<dyn FnOnce(&MemoryStore)>;
+
+    impl RacingStore {
+        /// Runs `action` right before our next save to `key`, for example a
+        /// configuration change on another worker.
+        fn before_save(&self, key: &str, action: impl FnOnce(&MemoryStore) + 'static) {
+            *self.before.borrow_mut() = Some((key.to_owned(), Box::new(action)));
+        }
+
+        fn race(&self, key: &str, other: impl Fn(Option<Vec<u8>>) -> Vec<u8> + 'static) {
+            self.others
+                .borrow_mut()
+                .push_back((key.to_owned(), Box::new(other)));
+        }
+
+        /// Another worker merging `delta` into the catalog at `key`.
+        fn race_merge(&self, key: &str, delta: Catalog) {
+            self.race(key, move |current| {
+                let mut catalog = current
+                    .and_then(|bytes| Catalog::decode(&bytes))
+                    .unwrap_or_default();
+                catalog.merge(&delta, BIG);
+                catalog.encode()
+            });
+        }
     }
 
     impl Store for RacingStore {
-        fn get(&self, key: &str) -> Option<Vec<u8>> {
+        fn get(&self, key: &str) -> Result<Option<(Vec<u8>, Version)>, StoreError> {
             self.inner.get(key)
         }
 
-        fn save(&self, key: &str, value: Vec<u8>) -> Result<(), StoreError> {
-            self.inner.save(key, value)?;
-            if let Some(stale) = self.clobbers.borrow_mut().pop_front() {
-                self.inner.save(key, stale)?;
+        fn save(&self, key: &str, value: Vec<u8>, expected: Expect<'_>) -> Result<(), StoreError> {
+            let next = {
+                let mut others = self.others.borrow_mut();
+                match others.front() {
+                    Some((other_key, _)) if other_key == key => others.pop_front(),
+                    _ => None,
+                }
+            };
+            if let Some((other_key, other)) = next {
+                put(&self.inner, &other_key, other(raw(&self.inner, &other_key)));
             }
-            Ok(())
+            let before = {
+                let mut before = self.before.borrow_mut();
+                match before.as_ref() {
+                    Some((before_key, _)) if before_key == key => before.take(),
+                    _ => None,
+                }
+            };
+            if let Some((_, action)) = before {
+                action(&self.inner);
+            }
+            self.inner.save(key, value, expected)
+        }
+
+        fn keys(&self) -> Vec<String> {
+            self.inner.keys()
+        }
+
+        fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key)
         }
     }
 
-    struct FailingStore;
+    /// Every operation fails while `failing` is set.
+    #[derive(Default)]
+    struct FlakyStore {
+        inner: MemoryStore,
+        failing: Cell<bool>,
+    }
 
-    impl Store for FailingStore {
-        fn get(&self, _: &str) -> Option<Vec<u8>> {
-            None
+    impl Store for FlakyStore {
+        fn get(&self, key: &str) -> Result<Option<(Vec<u8>, Version)>, StoreError> {
+            if self.failing.get() {
+                return Err(StoreError::Failed);
+            }
+            self.inner.get(key)
         }
 
-        fn save(&self, _: &str, _: Vec<u8>) -> Result<(), StoreError> {
-            Err(StoreError)
+        fn save(&self, key: &str, value: Vec<u8>, expected: Expect<'_>) -> Result<(), StoreError> {
+            if self.failing.get() {
+                return Err(StoreError::Failed);
+            }
+            self.inner.save(key, value, expected)
         }
+
+        fn keys(&self) -> Vec<String> {
+            if self.failing.get() {
+                return Vec::new();
+            }
+            self.inner.keys()
+        }
+
+        fn delete(&self, key: &str) -> Result<(), StoreError> {
+            if self.failing.get() {
+                return Err(StoreError::Failed);
+            }
+            self.inner.delete(key)
+        }
+    }
+
+    fn failing_store() -> FlakyStore {
+        let store = FlakyStore::default();
+        store.failing.set(true);
+        store
     }
 
     fn observations() -> Vec<(&'static str, Pin)> {
@@ -914,11 +1321,44 @@ mod tests {
         ]
     }
 
+    fn class_of(catalog: Option<&Catalog>, tool: &str) -> Option<Class> {
+        catalog.and_then(|c| c.pin(tool)).map(|p| p.class)
+    }
+
+    #[test]
+    fn the_memory_store_is_compare_and_swap() {
+        let store = MemoryStore::default();
+        assert_eq!(store.save("k", b"1".to_vec(), Expect::Absent), Ok(()));
+        assert_eq!(
+            store.save("k", b"2".to_vec(), Expect::Absent),
+            Err(StoreError::Conflict)
+        );
+        let version = store.get("k").ok().flatten().map(|(_, v)| v);
+        let version = version.unwrap_or_else(|| unreachable!());
+        assert_eq!(
+            store.save("k", b"2".to_vec(), Expect::Version(&version)),
+            Ok(())
+        );
+        assert_eq!(
+            store.save("k", b"3".to_vec(), Expect::Version(&version)),
+            Err(StoreError::Conflict),
+            "the version changed"
+        );
+        assert_eq!(raw(&store, "k"), Some(b"2".to_vec()));
+        // Like the gateway, a version is only checked against a stored value.
+        assert_eq!(store.delete("k"), Ok(()));
+        assert_eq!(
+            store.save("k", b"4".to_vec(), Expect::Version(&version)),
+            Ok(())
+        );
+        assert_eq!(raw(&store, "k"), Some(b"4".to_vec()));
+    }
+
     #[test]
     fn success_writes_local_and_shared_copies() {
         let store = Rc::new(MemoryStore::default());
-        let mut worker = Catalogs::new(Rc::clone(&store), SETTINGS);
-        let report = worker.record_success("k", 100, &observations());
+        let mut w = worker(Rc::clone(&store));
+        let report = w.record_success("k", 100, &observations());
         assert_eq!(
             report.changes,
             vec![
@@ -927,14 +1367,12 @@ mod tests {
             ]
         );
         assert!(!report.retry_exhausted);
-        let shared = store.get("k").and_then(|b| Catalog::decode(&b));
+        let copy = shared(&*store, "k");
+        assert_eq!(class_of(copy.as_ref(), "drop"), Some(Class::Destructive));
+        assert_eq!(copy.map(|c| c.freshness().last_success_at), Some(Some(100)));
         assert_eq!(
-            shared.as_ref().and_then(|c| c.pin("drop")).map(|p| p.class),
-            Some(Class::Destructive)
-        );
-        assert_eq!(
-            shared.map(|c| c.freshness().last_success_at),
-            Some(Some(100))
+            raw(&*store, INDEX).and_then(|bytes| decode_index(&bytes)),
+            Some(BTreeSet::from(["k".to_owned()]))
         );
     }
 
@@ -948,32 +1386,26 @@ mod tests {
         };
         let (a, b) = (key("tenant-a"), key("tenant-b"));
         let store = Rc::new(MemoryStore::default());
-        let mut worker = Catalogs::new(Rc::clone(&store), SETTINGS);
-        worker.record_success(&a, 100, &[("operate", pin(Class::Read))]);
-        worker.record_success(&b, 100, &[("operate", pin(Class::Destructive))]);
+        let mut w = worker(Rc::clone(&store));
+        w.record_success(&a, 100, &[("operate", pin(Class::Read))]);
+        w.record_success(&b, 100, &[("operate", pin(Class::Destructive))]);
+        assert_eq!(class_of(Some(w.read(&a)), "operate"), Some(Class::Read));
         assert_eq!(
-            worker.read(&a).pin("operate").map(|p| p.class),
-            Some(Class::Read)
-        );
-        assert_eq!(
-            worker.read(&b).pin("operate").map(|p| p.class),
+            class_of(Some(w.read(&b)), "operate"),
             Some(Class::Destructive)
         );
-        let mut other = Catalogs::new(Rc::clone(&store), SETTINGS);
-        assert_eq!(
-            other.read(&a).pin("operate").map(|p| p.class),
-            Some(Class::Read)
-        );
+        let mut other = worker(Rc::clone(&store));
+        assert_eq!(class_of(Some(other.read(&a)), "operate"), Some(Class::Read));
     }
 
     #[test]
     fn another_worker_reads_pins_from_the_shared_copy() {
         let store = Rc::new(MemoryStore::default());
-        let mut first = Catalogs::new(Rc::clone(&store), SETTINGS);
-        let mut second = Catalogs::new(Rc::clone(&store), SETTINGS);
+        let mut first = worker(Rc::clone(&store));
+        let mut second = worker(Rc::clone(&store));
         first.record_success("k", 100, &observations());
         assert_eq!(
-            second.read("k").pin("drop").map(|p| p.class),
+            class_of(Some(second.read("k")), "drop"),
             Some(Class::Destructive)
         );
     }
@@ -981,130 +1413,317 @@ mod tests {
     #[test]
     fn concurrent_writers_converge() {
         let store = Rc::new(MemoryStore::default());
-        let mut first = Catalogs::new(Rc::clone(&store), SETTINGS);
-        let mut second = Catalogs::new(Rc::clone(&store), SETTINGS);
+        let mut first = worker(Rc::clone(&store));
+        let mut second = worker(Rc::clone(&store));
         first.record_success("k", 100, &[("a", pin(Class::Read))]);
         second.record_success(
             "k",
             101,
             &[("b", pin(Class::Write)), ("a", pin(Class::Write))],
         );
-        let shared = store.get("k").and_then(|b| Catalog::decode(&b));
+        let copy = shared(&*store, "k");
+        assert_eq!(class_of(copy.as_ref(), "a"), Some(Class::Write));
+        assert_eq!(class_of(copy.as_ref(), "b"), Some(Class::Write));
+        assert_eq!(class_of(Some(first.read("k")), "b"), Some(Class::Write));
+    }
+
+    #[test]
+    fn a_concurrent_upgrade_is_never_overwritten() {
+        let store = Rc::new(RacingStore::default());
+        let mut w = worker(Rc::clone(&store));
+        w.record_success("k", 100, &[("other", pin(Class::Read))]);
+        // Between our read and our save, another worker upgrades "other".
+        store.race_merge("k", catalog(&[("other", Class::Destructive)], None, None));
+        let report = w.record_success("k", 200, &observations());
+        assert!(!report.retry_exhausted, "the retry merges both");
+        let copy = shared(&*store, "k");
         assert_eq!(
-            shared.as_ref().and_then(|c| c.pin("a")).map(|p| p.class),
-            Some(Class::Write)
+            class_of(copy.as_ref(), "other"),
+            Some(Class::Destructive),
+            "the upgrade survives our save"
         );
+        assert_eq!(class_of(copy.as_ref(), "drop"), Some(Class::Destructive));
         assert_eq!(
-            shared.as_ref().and_then(|c| c.pin("b")).map(|p| p.class),
-            Some(Class::Write)
-        );
-        assert_eq!(
-            first.read("k").pin("b").map(|p| p.class),
-            Some(Class::Write)
+            class_of(w.local_copy("k"), "other"),
+            Some(Class::Destructive),
+            "and this worker learns it"
         );
     }
 
     #[test]
-    fn a_stale_overwrite_is_detected_and_repaired() {
+    fn a_concurrent_failure_is_never_erased() {
         let store = Rc::new(RacingStore::default());
-        // Another worker's older copy, without our pins.
-        store
-            .clobbers
-            .borrow_mut()
-            .push_back(catalog(&[("old", Class::Read)], Some(1), None).encode());
-        let mut worker = Catalogs::new(Rc::clone(&store), SETTINGS);
-        let report = worker.record_success("k", 100, &observations());
-        assert!(!report.retry_exhausted, "the second attempt repairs it");
-        let shared = store.get("k").and_then(|b| Catalog::decode(&b));
-        assert!(shared
-            .as_ref()
-            .is_some_and(|c| c.pin("drop").is_some() && c.pin("old").is_some()));
-        assert!(
-            worker
-                .local_copy("k")
-                .is_some_and(|c| c.pin("old").is_some()),
-            "local copy gains the other worker's pins"
-        );
+        let mut w = worker(Rc::clone(&store));
+        w.record_success("k", 100, &observations());
+        // Another worker could not inspect a list at 150; our success was read before.
+        store.race_merge("k", catalog(&[], None, Some(150)));
+        let report = w.record_success("k", 120, &[]);
+        assert!(!report.retry_exhausted);
+        let copy = shared(&*store, "k");
+        assert_eq!(copy.map(|c| c.freshness().last_failure_at), Some(Some(150)));
+        assert!(w.read("k").is_stale(200, 0), "the catalog stays stale");
+        let mut other = worker(Rc::clone(&store));
+        assert!(other.read("k").is_stale(200, 0));
     }
 
     #[test]
     fn retries_are_bounded() {
         let store = Rc::new(RacingStore::default());
-        for _ in 0..WRITE_ATTEMPTS {
-            store
-                .clobbers
-                .borrow_mut()
-                .push_back(Catalog::default().encode());
+        let mut w = worker(Rc::clone(&store));
+        w.record_success("k", 100, &[]);
+        for i in 0..WRITE_ATTEMPTS {
+            let name = format!("other{i}");
+            store.race_merge("k", catalog(&[(&name, Class::Read)], None, None));
         }
-        let mut worker = Catalogs::new(Rc::clone(&store), SETTINGS);
-        let report = worker.record_success("k", 100, &observations());
+        let report = w.record_success("k", 200, &observations());
         assert!(report.retry_exhausted);
         assert_eq!(
-            worker.read("k").pin("drop").map(|p| p.class),
+            class_of(Some(w.read("k")), "drop"),
             Some(Class::Destructive),
             "local pins stay"
+        );
+        assert!(
+            shared(&*store, "k").is_some_and(|c| c.pin("other0").is_some()),
+            "the other worker's saves are kept"
         );
     }
 
     #[test]
     fn a_failing_store_keeps_local_pins() {
-        let mut worker = Catalogs::new(FailingStore, SETTINGS);
-        let report = worker.record_success("k", 100, &observations());
+        let mut w = worker(failing_store());
+        let report = w.record_success("k", 100, &observations());
         assert!(report.retry_exhausted);
-        assert!(worker.read("k").pin("drop").is_some());
+        assert_eq!(report.capacity, None);
+        assert!(w.read("k").pin("drop").is_some());
+    }
+
+    #[test]
+    fn copies_the_store_did_not_accept_are_bounded_and_kept() {
+        let settings = CatalogSettings {
+            max_catalogs: 2,
+            ..SETTINGS
+        };
+        let mut w = worker_with(failing_store(), settings);
+        w.record_success("a", 1, &observations());
+        w.record_success("b", 2, &observations());
+        let refused = w.record_success("c", 3, &observations());
+        assert_eq!(refused.capacity, Some(CapacityLimit::MaxCatalogs));
+        assert_eq!(
+            refused.changes,
+            vec![PinChange::NotPinned(CapacityLimit::MaxCatalogs); 2]
+        );
+        assert!(w.local_copy("c").is_none());
+        assert!(w.read("c").pin("drop").is_none(), "its tools stay unknown");
+        assert!(w.local_copy("a").is_some() && w.local_copy("b").is_some());
+        // An existing copy still updates.
+        let update = w.record_success("a", 4, &[("new", pin(Class::Write))]);
+        assert_eq!(update.capacity, None);
+        assert!(w.read("a").pin("new").is_some());
+    }
+
+    #[test]
+    fn nothing_is_evicted_and_new_catalogs_are_refused_at_max_catalogs() {
+        let settings = CatalogSettings {
+            max_catalogs: 1,
+            ..SETTINGS
+        };
+        let store = Rc::new(MemoryStore::default());
+        let mut w = worker_with(Rc::clone(&store), settings);
+        w.record_success("a", 1, &observations());
+        let refused = w.record_success("b", 2, &observations());
+        assert_eq!(refused.capacity, Some(CapacityLimit::MaxCatalogs));
+        assert!(refused
+            .changes
+            .iter()
+            .all(|c| *c == PinChange::NotPinned(CapacityLimit::MaxCatalogs)));
+        assert!(!refused.retry_exhausted);
+        assert_eq!(raw(&*store, "b"), None, "no shared copy");
+        assert!(w.local_copy("b").is_none(), "no local copy");
+        assert!(w.read("b").pin("drop").is_none());
+        assert!(w.local_copy("b").is_none(), "reading creates none either");
+        assert!(w.record_failure("b", 3).capacity.is_some());
+        assert_eq!(
+            class_of(Some(w.read("a")), "drop"),
+            Some(Class::Destructive),
+            "the first catalog is kept"
+        );
+        let mut other = worker_with(Rc::clone(&store), settings);
+        assert_eq!(
+            other.record_success("b", 4, &observations()).capacity,
+            Some(CapacityLimit::MaxCatalogs),
+            "every worker refuses it"
+        );
+        assert_eq!(
+            other.record_success("a", 5, &[("more", pin(Class::Read))]),
+            WriteReport {
+                changes: vec![PinChange::New(pin(Class::Read))],
+                ..WriteReport::default()
+            }
+        );
+    }
+
+    #[test]
+    fn the_index_is_exact_under_concurrent_admission() {
+        let settings = CatalogSettings {
+            max_catalogs: 1,
+            ..SETTINGS
+        };
+        // Another worker admits a different catalog first: ours is refused.
+        let store = Rc::new(RacingStore::default());
+        store.race(INDEX, |_| {
+            encode_index(&BTreeSet::from(["other".to_owned()]))
+        });
+        let mut w = worker_with(Rc::clone(&store), settings);
+        let report = w.record_success("k", 1, &observations());
+        assert_eq!(report.capacity, Some(CapacityLimit::MaxCatalogs));
+        assert_eq!(
+            raw(&*store, INDEX).and_then(|bytes| decode_index(&bytes)),
+            Some(BTreeSet::from(["other".to_owned()]))
+        );
+        assert_eq!(raw(&*store, "k"), None);
+
+        // Another worker admits the same catalog first: ours is admitted too.
+        let store = Rc::new(RacingStore::default());
+        store.race(INDEX, |_| encode_index(&BTreeSet::from(["k".to_owned()])));
+        let mut w = worker_with(Rc::clone(&store), settings);
+        let report = w.record_success("k", 1, &observations());
+        assert_eq!(report.capacity, None);
+        assert!(!report.retry_exhausted);
+        assert!(shared(&*store, "k").is_some_and(|c| c.pin("drop").is_some()));
+    }
+
+    #[test]
+    fn an_unreadable_index_is_never_overwritten() {
+        let store = Rc::new(MemoryStore::default());
+        put(&store, INDEX, br#"{"v":2,"k":[]}"#.to_vec());
+        let mut w = worker(Rc::clone(&store));
+        let report = w.record_success("k", 1, &observations());
+        assert!(report.retry_exhausted, "kept by this worker only");
+        assert!(w.read("k").pin("drop").is_some());
+        assert_eq!(raw(&*store, "k"), None);
+        assert_eq!(raw(&*store, INDEX), Some(br#"{"v":2,"k":[]}"#.to_vec()));
+    }
+
+    #[test]
+    fn merging_at_capacity_keeps_the_shared_pins() {
+        let settings = CatalogSettings {
+            limits: CatalogLimits {
+                max_cached_tools: 1,
+                max_catalog_bytes: 1 << 20,
+            },
+            ..SETTINGS
+        };
+        let store = Rc::new(FlakyStore::default());
+        let mut first = worker_with(Rc::clone(&store), settings);
+        let mut second = worker_with(Rc::clone(&store), settings);
+        // The store is down while the second worker learns "b".
+        store.failing.set(true);
+        assert!(
+            second
+                .record_success("k", 1, &[("b", pin(Class::Read))])
+                .retry_exhausted
+        );
+        store.failing.set(false);
+        first.record_success("k", 2, &[("a", pin(Class::Destructive))]);
+        // The second worker now has two copies that do not fit together.
+        assert_eq!(
+            class_of(Some(second.read("k")), "a"),
+            Some(Class::Destructive),
+            "the shared pin wins"
+        );
+        assert_eq!(second.read("k").pin("b"), None);
+        let report = second.record_success("k", 3, &[("b", pin(Class::Read))]);
+        assert_eq!(report.capacity, Some(CapacityLimit::MaxCachedTools));
+        assert_eq!(
+            shared(&store.inner, "k").map(|c| c.len()),
+            Some(1),
+            "the shared copy keeps its pin"
+        );
+        assert_eq!(second.read("k"), first.read("k"), "both workers agree");
+    }
+
+    #[test]
+    fn an_unreadable_shared_copy_is_never_overwritten() {
+        let partly = br#"{"v":1,"s":1,"f":null,"t":{"ok":"da","future":"zz"}}"#.to_vec();
+        let other_version = br#"{"v":2,"s":1,"f":null,"t":{}}"#.to_vec();
+        for stored in [partly, other_version] {
+            let store = Rc::new(MemoryStore::default());
+            put(&store, "k", stored.clone());
+            let mut w = worker(Rc::clone(&store));
+            let report = w.record_success("k", 100, &observations());
+            assert!(report.retry_exhausted);
+            assert_eq!(raw(&*store, "k"), Some(stored), "left as it is");
+            assert!(w.read("k").pin("drop").is_some(), "kept by this worker");
+        }
+        // Reading skips only the entries it does not know.
+        let store = Rc::new(MemoryStore::default());
+        put(
+            &store,
+            "k",
+            br#"{"v":1,"s":1,"f":null,"t":{"ok":"da","future":"zz"}}"#.to_vec(),
+        );
+        assert_eq!(
+            class_of(Some(worker(Rc::clone(&store)).read("k")), "ok"),
+            Some(Class::Destructive)
+        );
+    }
+
+    #[test]
+    fn other_configurations_are_removed() {
+        let store = MemoryStore::default();
+        let (ours, old) = ("a".repeat(32), "b".repeat(32));
+        let partition = "c".repeat(32);
+        let keep = [
+            catalog_key("api-1", &ours, ""),
+            catalog_key("api-1", &ours, &partition),
+            index_key("api-1", &ours),
+            catalog_key("api-2", &old, ""),
+            index_key("api-2", &old),
+            catalog_key("api-1:x", &old, ""),
+            "unrelated:key".to_owned(),
+        ];
+        let remove = [
+            catalog_key("api-1", &old, ""),
+            catalog_key("api-1", &old, &partition),
+            index_key("api-1", &old),
+        ];
+        for key in keep.iter().chain(&remove) {
+            put(&store, key, b"x".to_vec());
+        }
+        assert_eq!(remove_other_configurations(&store, "api-1", &ours), 3);
+        let mut left = store.keys();
+        left.sort();
+        let mut expected = keep.to_vec();
+        expected.sort();
+        assert_eq!(left, expected);
+        assert_eq!(
+            remove_other_configurations(&failing_store(), "api-1", &ours),
+            0
+        );
     }
 
     #[test]
     fn freshness_transitions_are_reported() {
-        let mut worker = Catalogs::new(MemoryStore::default(), SETTINGS);
-        assert!(
-            !worker
-                .record_success("k", 100, &observations())
-                .became_fresh
-        );
-        let failure = worker.record_failure("k", 200);
+        let mut w = worker(MemoryStore::default());
+        assert!(!w.record_success("k", 100, &observations()).became_fresh);
+        let failure = w.record_failure("k", 200);
         assert!(failure.became_stale && !failure.became_fresh);
-        assert!(worker.read("k").is_stale(250, 0));
-        assert!(
-            !worker.record_failure("k", 300).became_stale,
-            "already stale"
-        );
-        let success = worker.record_success("k", 400, &[]);
+        assert!(w.read("k").is_stale(250, 0));
+        assert!(!w.record_failure("k", 300).became_stale, "already stale");
+        let success = w.record_success("k", 400, &[]);
         assert!(success.became_fresh);
-        assert!(
-            worker.read("k").pin("drop").is_some(),
-            "pins survive staleness"
-        );
+        assert!(w.read("k").pin("drop").is_some(), "pins survive staleness");
     }
 
     #[test]
     fn a_change_after_the_list_learns_pins_and_ends_stale() {
-        let mut worker = Catalogs::new(MemoryStore::default(), SETTINGS);
-        let report = worker.record_success_then_changed("k", 100, &observations());
+        let mut w = worker(MemoryStore::default());
+        let report = w.record_success_then_changed("k", 100, &observations());
         assert!(report.became_stale && !report.became_fresh);
-        assert!(worker.read("k").is_stale(100, 0));
-        assert!(worker.read("k").pin("drop").is_some());
+        assert!(w.read("k").is_stale(100, 0));
+        assert!(w.read("k").pin("drop").is_some());
         // The next processed list clears it once the clock has moved on.
-        assert!(worker.record_success("k", 101, &[]).became_fresh);
-    }
-
-    #[test]
-    fn local_copies_are_bounded() {
-        let settings = CatalogSettings {
-            max_local_catalogs: 2,
-            ..SETTINGS
-        };
-        let mut worker = Catalogs::new(FailingStore, settings);
-        worker.record_success("a", 1, &observations());
-        worker.record_success("b", 2, &observations());
-        worker.read("a");
-        worker.record_success("c", 3, &observations());
-        assert!(worker.local_copy("a").is_some(), "recently used");
-        assert!(
-            worker.local_copy("b").is_none(),
-            "least recently used is evicted"
-        );
-        assert!(worker.local_copy("c").is_some());
+        assert!(w.record_success("k", 101, &[]).became_fresh);
     }
 
     #[test]
@@ -1116,12 +1735,150 @@ mod tests {
             },
             ..SETTINGS
         };
-        let mut worker = Catalogs::new(MemoryStore::default(), settings);
-        let report = worker.record_success("k", 1, &observations());
+        let mut w = worker_with(MemoryStore::default(), settings);
+        let report = w.record_success("k", 1, &observations());
         assert_eq!(report.capacity, Some(CapacityLimit::MaxCachedTools));
         assert_eq!(
             report.changes.get(1),
             Some(&PinChange::NotPinned(CapacityLimit::MaxCachedTools))
         );
+    }
+
+    #[test]
+    fn a_copy_kept_by_one_worker_still_learns_once_max_catalogs_is_reached() {
+        let settings = CatalogSettings {
+            max_catalogs: 20,
+            ..SETTINGS
+        };
+        let store = Rc::new(RacingStore::default());
+        // Other workers admit their own catalogs during each of our index saves.
+        for i in 0..(2 * WRITE_ATTEMPTS) {
+            let name = format!("other{i}");
+            store.race(INDEX, move |current| {
+                let mut keys = current.and_then(|b| decode_index(&b)).unwrap_or_default();
+                keys.insert(name.clone());
+                encode_index(&keys)
+            });
+        }
+        let mut w = worker_with(Rc::clone(&store), settings);
+        assert!(
+            w.record_success("k", 100, &[("x", pin(Class::Read))])
+                .retry_exhausted
+        );
+        assert_eq!(raw(&*store, "k"), None, "kept by this worker only");
+
+        let mut other = worker_with(Rc::clone(&store), settings);
+        for i in 0..4 {
+            other.record_success(&format!("fill{i}"), 101, &[]);
+        }
+        let index = raw(&*store, INDEX).and_then(|b| decode_index(&b));
+        assert_eq!(index.map(|keys| keys.len()), Some(20));
+
+        let upgrade = w.record_success("k", 200, &[("x", pin(Class::Destructive))]);
+        assert_eq!(upgrade.capacity, Some(CapacityLimit::MaxCatalogs));
+        assert!(upgrade.retry_exhausted);
+        assert_eq!(
+            upgrade.changes,
+            vec![PinChange::Upgraded {
+                from: Class::Read,
+                to: Class::Destructive
+            }]
+        );
+        assert_eq!(class_of(w.local_copy("k"), "x"), Some(Class::Destructive));
+        assert_eq!(class_of(Some(w.read("k")), "x"), Some(Class::Destructive));
+
+        let failure = w.record_failure("k", 300);
+        assert!(failure.became_stale);
+        assert!(w.read("k").is_stale(400, 0));
+        assert_eq!(raw(&*store, "k"), None, "still not in the shared store");
+    }
+
+    #[test]
+    fn a_removed_shared_copy_drops_the_local_copies_taken_from_it() {
+        let api = "api-1";
+        let (ours, next) = ("a".repeat(32), "b".repeat(32));
+        let key = catalog_key(api, &ours, "");
+        let store = Rc::new(MemoryStore::default());
+        let mut w1 = Catalogs::new(Rc::clone(&store), SETTINGS, index_key(api, &ours));
+        let mut w2 = Catalogs::new(Rc::clone(&store), SETTINGS, index_key(api, &ours));
+        w1.record_success(&key, 100, &[("x", pin(Class::Read))]);
+        assert_eq!(class_of(Some(w2.read(&key)), "x"), Some(Class::Read));
+        w1.record_success(&key, 200, &[("x", pin(Class::Destructive))]);
+
+        // Another configuration is applied, and this one is later served
+        // again by the same workers.
+        assert_eq!(remove_other_configurations(&*store, api, &next), 2);
+        assert_eq!(class_of(Some(w2.read(&key)), "x"), None, "starts over");
+        assert_eq!(class_of(Some(w1.read(&key)), "x"), None, "starts over");
+        assert_eq!(w2.local_copy(&key).and_then(|c| c.pin("x")), None);
+
+        // A later save does not bring back the older pin.
+        w2.record_success(&key, 300, &[]);
+        let mut w3 = Catalogs::new(Rc::clone(&store), SETTINGS, index_key(api, &ours));
+        assert_eq!(class_of(Some(w3.read(&key)), "x"), None);
+    }
+
+    #[test]
+    fn a_save_racing_a_configuration_change_leaves_one_catalog_until_the_next_change() {
+        let api = "api-1";
+        let (ours, next) = ("a".repeat(32), "b".repeat(32));
+        let key = catalog_key(api, &ours, "");
+        let index = index_key(api, &ours);
+        let settings = CatalogSettings {
+            max_catalogs: 1,
+            ..SETTINGS
+        };
+        let store = Rc::new(RacingStore::default());
+        let mut w = Catalogs::new(Rc::clone(&store), settings, index.clone());
+        w.record_success(&key, 100, &[("x", pin(Class::Read))]);
+        let removed = next.clone();
+        store.before_save(&key, move |inner| {
+            assert_eq!(remove_other_configurations(inner, api, &removed), 2);
+        });
+
+        // The gateway inserts into a key removed since it was read.
+        let report = w.record_success(&key, 200, &[("y", pin(Class::Write))]);
+        assert!(!report.retry_exhausted);
+        assert_eq!(raw(&*store, &index), None);
+        let left = shared(&*store, &key);
+        assert_eq!(class_of(left.as_ref(), "x"), Some(Class::Read));
+        assert_eq!(class_of(left.as_ref(), "y"), Some(Class::Write));
+
+        // The next configuration change removes it.
+        assert_eq!(remove_other_configurations(&*store, api, &next), 1);
+        assert_eq!(raw(&*store, &key), None);
+    }
+
+    #[test]
+    fn reports_describe_the_copy_that_is_kept() {
+        // Another worker records a newer failure while we save a success.
+        let store = Rc::new(RacingStore::default());
+        let mut w = worker(Rc::clone(&store));
+        w.record_success("k", 100, &[]);
+        w.record_failure("k", 150);
+        store.race_merge("k", catalog(&[], None, Some(170)));
+        let report = w.record_success("k", 160, &[]);
+        assert!(!report.became_fresh);
+        assert!(w.read("k").is_stale(200, 0));
+
+        // Another worker takes the last free place while we save a new tool.
+        let settings = CatalogSettings {
+            limits: CatalogLimits {
+                max_cached_tools: 1,
+                max_catalog_bytes: 1 << 20,
+            },
+            ..SETTINGS
+        };
+        let store = Rc::new(RacingStore::default());
+        let mut w = worker_with(Rc::clone(&store), settings);
+        w.record_success("k", 100, &[]);
+        store.race_merge("k", catalog(&[("z", Class::Read)], None, None));
+        let report = w.record_success("k", 200, &[("y", pin(Class::Destructive))]);
+        assert_eq!(
+            report.changes,
+            vec![PinChange::NotPinned(CapacityLimit::MaxCachedTools)]
+        );
+        assert_eq!(report.capacity, Some(CapacityLimit::MaxCachedTools));
+        assert_eq!(w.read("k").pin("y"), None);
     }
 }
