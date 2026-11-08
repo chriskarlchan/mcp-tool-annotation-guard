@@ -4,7 +4,7 @@ All notable changes to this policy are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/).
 
-## [1.0.1] - Unreleased
+## [1.0.1] - 2026-11-08
 
 ### Fixed
 
@@ -175,5 +175,5 @@ First release.
 See [docs/overview.md](docs/overview.md) for limitations and
 [docs/configuration.md](docs/configuration.md) for every property.
 
-[1.0.1]: https://github.com/chriskarlchan/mcp-tool-annotation-guard/compare/v1.0.0...HEAD
+[1.0.1]: https://github.com/chriskarlchan/mcp-tool-annotation-guard/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/chriskarlchan/mcp-tool-annotation-guard/releases/tag/v1.0.0
