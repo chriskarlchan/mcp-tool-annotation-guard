@@ -182,7 +182,7 @@ mod tests {
     }
 
     #[test]
-    fn annotation_table_from_section_6_3() {
+    fn annotation_table() {
         use Class::*;
         // (annotations, default class, strict class)
         let table = [

@@ -40,6 +40,10 @@ fn ok_backend(request: UnitHttpRequest) -> UnitHttpResponse {
         Some("list-read-only") => json(list_body(
             json!([{"name": "search", "annotations": {"readOnlyHint": true}}]),
         )),
+        // A later page: other tools only.
+        Some("list-page2") => json(list_body(
+            json!([{"name": "other", "annotations": {"readOnlyHint": true}}]),
+        )),
         // `drop` now claims to be read-only: a downgrade.
         Some("list-downgrade") => json(list_body(
             json!([{"name": "drop", "annotations": {"readOnlyHint": true}}]),
@@ -247,6 +251,11 @@ fn oversized_and_encoded_bodies_are_refused() {
     let encoded = h.send(post(call(1, "x")).with_header("content-encoding", "gzip"));
     assert_ne!(error_of(&encoded), Value::Null);
     assert!(!h.forwarded());
+
+    let utf7 =
+        h.send(post(call(1, "x")).with_header("content-type", "application/json; charset=utf-7"));
+    assert_eq!(utf7.status_code(), 415);
+    assert!(!h.forwarded());
 }
 
 // --- audit mode -----------------------------------------------------------
@@ -254,8 +263,8 @@ fn oversized_and_encoded_bodies_are_refused() {
 #[test]
 fn audit_mode_forwards_everything() {
     let mut h = harness(json!({"mode": "audit"}));
-    let call = h.send(post(call(1, "delete_everything")));
-    assert_eq!(call.status_code(), 200);
+    let unknown = h.send(post(call(1, "delete_everything")));
+    assert_eq!(unknown.status_code(), 200);
     assert!(h.forwarded());
 
     let parse = h.send(post(b"{not json".to_vec()));
@@ -264,6 +273,31 @@ fn audit_mode_forwards_everything() {
 
     let put = h.send(UnitHttpRequest::custom("PUT").with_body(b"{}".to_vec()));
     assert_eq!(put.status_code(), 200);
+    assert!(h.forwarded());
+
+    // Requests enforce mode refuses as protocol errors pass too.
+    for body in [
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search","Name":"drop"}}"#,
+        r#"{"jsonrpc":"2.0","id":3,"result":{},"Method":"tools/call","params":{"name":"drop"}}"#,
+    ] {
+        let response = h.send(post(body.as_bytes().to_vec()));
+        assert_eq!(response.status_code(), 200, "{}", body);
+        assert!(h.forwarded(), "{}", body);
+    }
+    let utf7 = h.send(
+        UnitHttpRequest::post()
+            .with_header("content-type", "application/json; charset=utf-7")
+            .with_header("accept", "application/json, text/event-stream")
+            .with_body(call(4, "search")),
+    );
+    assert_eq!(utf7.status_code(), 200);
+    assert!(h.forwarded());
+    let websocket = h.send(
+        UnitHttpRequest::get()
+            .with_header("connection", "Upgrade")
+            .with_header("upgrade", "websocket"),
+    );
+    assert_eq!(websocket.status_code(), 200);
     assert!(h.forwarded());
 }
 
@@ -287,6 +321,19 @@ fn method_rules() {
             .with_body(b"{}".to_vec()),
     );
     assert_eq!(get_with_body.status_code(), 405);
+    assert!(!h.forwarded());
+
+    // Over HTTP/2 a body needs no Content-Length.
+    let get_with_streamed_body = h.send(UnitHttpRequest::get().with_body(b"{}".to_vec()));
+    assert_eq!(get_with_streamed_body.status_code(), 405);
+    assert!(!h.forwarded());
+
+    let websocket = h.send(
+        UnitHttpRequest::get()
+            .with_header("connection", "Upgrade")
+            .with_header("upgrade", "websocket"),
+    );
+    assert_eq!(websocket.status_code(), 405);
     assert!(!h.forwarded());
 
     let overridden = h.send(UnitHttpRequest::get().with_header("x-http-method-override", "POST"));
@@ -496,6 +543,27 @@ fn a_stale_catalog_recovers_on_the_next_list() {
     h.send(list_request("list"));
     h.backend.next();
     assert_eq!(h.send(post(call(3, "search"))).status_code(), 200);
+    assert!(h.forwarded());
+}
+
+// After a list it can't inspect, the guard trusts a tool again only once a
+// list shows it: a later page doesn't make the earlier page's tools trusted.
+#[test]
+fn a_later_page_trusts_only_its_own_tools() {
+    let mut h = harness(json!({}));
+    h.send(list_request("list"));
+    h.send(list_request("list-gzip"));
+    h.send(list_request("list-page2"));
+    for _ in 0..3 {
+        h.backend.next();
+    }
+
+    assert_eq!(
+        reason_of(&h.send(post(call(2, "search")))),
+        json!("unknown_tool")
+    );
+    assert!(!h.forwarded());
+    assert_eq!(h.send(post(call(3, "other"))).status_code(), 200);
     assert!(h.forwarded());
 }
 

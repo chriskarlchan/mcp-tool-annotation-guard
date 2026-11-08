@@ -3,8 +3,8 @@
 //! A list response the gateway ends before its body is complete (here, a
 //! body over the gateway's 1 MiB buffer limit) never reaches the policy's
 //! body step. The client gets an error instead of the list, and the catalog
-//! is marked stale, so what earlier lists taught is not used until a list is
-//! inspected again.
+//! is marked stale, so what earlier lists taught about a tool is not used
+//! until a list the policy inspects shows the tool again.
 
 mod common;
 
@@ -168,7 +168,7 @@ async fn an_unfinished_list_marks_the_catalog_stale() -> anyhow::Result<()> {
         assert_eq!(reason(&body), Some("unknown_tool"), "{reply}: {body}");
         operate.assert_hits_async(forwarded).await;
 
-        // A list the policy inspects makes the catalog fresh again.
+        // A list the policy inspects that shows the tool makes it trusted again.
         let (status, _) = post(&client, &url, list(), "read").await?;
         assert_eq!(status, 200);
         let (status, body) = post(&client, &url, call(id + 1), "none").await?;

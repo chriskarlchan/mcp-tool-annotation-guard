@@ -48,6 +48,7 @@ pub enum RequestDetail {
     Envelope,
     IdType,
     DuplicateKeys,
+    AmbiguousKeys,
     DuplicateIds,
     EmptyBatch,
     UnsupportedBatch,
@@ -60,6 +61,7 @@ impl RequestDetail {
             RequestDetail::Envelope => "envelope",
             RequestDetail::IdType => "id_type",
             RequestDetail::DuplicateKeys => "duplicate_keys",
+            RequestDetail::AmbiguousKeys => "ambiguous_keys",
             RequestDetail::DuplicateIds => "duplicate_ids",
             RequestDetail::EmptyBatch => "empty_batch",
             RequestDetail::UnsupportedBatch => "unsupported_batch",
@@ -376,7 +378,7 @@ fn route(message: &Message<'_>, limits: EnvelopeLimits) -> Result<Route, Envelop
         (Kind::Request { id }, Some(TOOLS_LIST)) => Ok(Route::List(id.clone())),
         (Kind::Request { id }, Some(TOOLS_CALL)) => Ok(Route::Request(RequestElement {
             id: id.clone(),
-            call: check_call_params(message.params, limits),
+            call: check_call_params(message.params, limits)?,
         })),
         (Kind::Request { id }, _) => Ok(Route::Request(RequestElement {
             id: id.clone(),
@@ -390,20 +392,57 @@ fn route(message: &Message<'_>, limits: EnvelopeLimits) -> Result<Route, Envelop
     }
 }
 
-fn check_call_params(params: Option<&RawValue>, limits: EnvelopeLimits) -> CallCheck {
+fn check_call_params(
+    params: Option<&RawValue>,
+    limits: EnvelopeLimits,
+) -> Result<CallCheck, EnvelopeError> {
     let Some(params) = params.filter(|p| first_byte(p) == Some(b'{')) else {
-        return CallCheck::InvalidParams(ParamsDetail::ParamsType);
+        return Ok(CallCheck::InvalidParams(ParamsDetail::ParamsType));
     };
     let Ok(members) = serde_json::from_str::<BTreeMap<String, &RawValue>>(params.get()) else {
-        return CallCheck::InvalidParams(ParamsDetail::ParamsType);
+        return Ok(CallCheck::InvalidParams(ParamsDetail::ParamsType));
     };
+    if has_folded_duplicates(members.keys()) {
+        return Err(EnvelopeError::InvalidRequest(RequestDetail::DuplicateKeys));
+    }
     let Some(name) = members.get("name").and_then(|raw| decode_string(raw)) else {
-        return CallCheck::InvalidParams(ParamsDetail::MissingToolName);
+        return Ok(CallCheck::InvalidParams(ParamsDetail::MissingToolName));
     };
     if name.len() > limits.max_tool_name_bytes {
-        return CallCheck::InvalidParams(ParamsDetail::NameTooLong);
+        return Ok(CallCheck::InvalidParams(ParamsDetail::NameTooLong));
     }
-    CallCheck::Call { name }
+    Ok(CallCheck::Call { name })
+}
+
+/// `true` if two keys may name the same member for some server. Go's
+/// `encoding/json` matches member names regardless of case (with `ſ` as `s`,
+/// `ı` and `İ` as `i`, and `K` as `k`), and some JSON libraries ignore a NUL
+/// in a name, so a server may read `"Name"` or `"name\u0000"` as `name`. Keys
+/// are compared with NULs removed and case folded, which covers both.
+pub(crate) fn has_folded_duplicates<'k>(keys: impl Iterator<Item = &'k String>) -> bool {
+    let mut seen = HashSet::new();
+    keys.map(|key| fold_key(key))
+        .any(|folded| !seen.insert(folded))
+}
+
+/// A key with NULs removed and case folded (see [`has_folded_duplicates`]).
+pub(crate) fn fold_key(key: &str) -> String {
+    key.chars()
+        .filter(|&c| c != '\0')
+        // Lowercased, `İ` is `i` followed by a combining dot.
+        .map(|c| if c == '\u{130}' { 'i' } else { c })
+        .flat_map(char::to_uppercase)
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// The members of a JSON-RPC message.
+const MEMBERS: [&str; 6] = ["jsonrpc", "id", "method", "params", "result", "error"];
+
+/// `true` if a key isn't a JSON-RPC member but a server may read it as one
+/// (see [`has_folded_duplicates`]), such as `Method` for `method`.
+fn has_member_variant<'k>(mut keys: impl Iterator<Item = &'k String>) -> bool {
+    keys.any(|key| !MEMBERS.contains(&key.as_str()) && MEMBERS.contains(&fold_key(key).as_str()))
 }
 
 /// Classifies one message object. The input must already
@@ -415,6 +454,15 @@ pub fn parse_message(raw: &RawValue) -> Result<Message<'_>, RequestDetail> {
     }
     let members: BTreeMap<String, &RawValue> =
         serde_json::from_str(raw.get()).map_err(|_| envelope)?;
+    if has_folded_duplicates(members.keys()) {
+        return Err(RequestDetail::DuplicateKeys);
+    }
+    // `{"id":1,"result":{},"Method":"tools/call",...}` is a response to the
+    // guard, but a request to a server that reads `Method` as `method` and
+    // takes any message with a method for a request.
+    if has_member_variant(members.keys()) {
+        return Err(RequestDetail::AmbiguousKeys);
+    }
 
     if members
         .get("jsonrpc")
@@ -498,6 +546,11 @@ pub enum Gate {
     Inspect,
     /// A bodiless GET, DELETE, OPTIONS or HEAD.
     PassThrough,
+    /// A GET, DELETE, OPTIONS or HEAD whose headers don't end the request
+    /// (over HTTP/2 and HTTP/3 a body needs no `Content-Length`). It passes
+    /// only if its body is empty, and is refused `MethodNotAllowed`
+    /// otherwise.
+    PassThroughIfEmpty,
     Refuse(HttpRefusal),
 }
 
@@ -527,12 +580,65 @@ pub fn is_identity_encoding(value: Option<&str>) -> bool {
     })
 }
 
-/// The HTTP method rules. `header` looks a header up by lowercase name.
+/// The WHATWG Encoding labels for UTF-8.
+pub(crate) const UTF8_LABELS: [&str; 6] = [
+    "unicode-1-1-utf-8",
+    "unicode11utf8",
+    "unicode20utf8",
+    "utf-8",
+    "utf8",
+    "x-unicode20utf8",
+];
+
+/// `true` for a UTF-8 label, also in quotes (any case).
+pub(crate) fn is_utf8_label(charset: &str) -> bool {
+    let charset = charset
+        .strip_prefix('"')
+        .and_then(|quoted| quoted.strip_suffix('"'))
+        .unwrap_or(charset);
+    UTF8_LABELS
+        .iter()
+        .any(|label| charset.eq_ignore_ascii_case(label))
+}
+
+/// `true` if a request `Content-Type` names no charset, or only UTF-8.
+/// Some servers decode a request body with the charset its client names
+/// (Express's `express.json()` decodes UTF-7, where `+AG4-ame` is `name`), so
+/// a body the guard reads as UTF-8 could mean something else to them. Any
+/// mention of a charset that isn't a plain `charset=` UTF-8 parameter counts,
+/// as some servers find a charset anywhere in the value.
+pub fn names_only_utf8(content_type: Option<&str>) -> bool {
+    content_type.is_none_or(|value| {
+        value.split(';').all(|part| {
+            if !fold_key(part).contains("charset") {
+                return true;
+            }
+            part.split_once('=').is_some_and(|(key, charset)| {
+                key.trim().eq_ignore_ascii_case("charset") && is_utf8_label(charset.trim())
+            })
+        })
+    })
+}
+
+/// The HTTP method rules. `body_follows` is `true` if the request headers
+/// didn't end the request, and `header` looks a header up by lowercase name.
 /// Method names are case-sensitive (RFC 9110), so `post` is another method.
-pub fn gate_request<'h>(method: &str, header: impl Fn(&str) -> Option<&'h str>) -> Gate {
+pub fn gate_request<'h>(
+    method: &str,
+    body_follows: bool,
+    header: impl Fn(&str) -> Option<&'h str>,
+) -> Gate {
+    // After an upgrade (to a WebSocket, for example) the connection no
+    // longer carries HTTP requests, so the guard could not check the
+    // messages on it. MCP over HTTP never upgrades.
+    if header("upgrade").is_some() {
+        return Gate::Refuse(HttpRefusal::MethodNotAllowed);
+    }
     match method {
         "POST" => {
-            if is_identity_encoding(header("content-encoding")) {
+            if is_identity_encoding(header("content-encoding"))
+                && names_only_utf8(header("content-type"))
+            {
                 Gate::Inspect
             } else {
                 Gate::Refuse(HttpRefusal::Encoded)
@@ -544,10 +650,12 @@ pub fn gate_request<'h>(method: &str, header: impl Fn(&str) -> Option<&'h str>) 
             let no_override = METHOD_OVERRIDE_HEADERS
                 .iter()
                 .all(|name| header(name).is_none());
-            if no_body && no_override {
-                Gate::PassThrough
-            } else {
+            if !(no_body && no_override) {
                 Gate::Refuse(HttpRefusal::MethodNotAllowed)
+            } else if body_follows {
+                Gate::PassThroughIfEmpty
+            } else {
+                Gate::PassThrough
             }
         }
         _ => Gate::Refuse(HttpRefusal::MethodNotAllowed),
@@ -716,6 +824,84 @@ mod tests {
         assert_eq!(inspect(body), invalid(RequestDetail::DuplicateKeys));
         let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","method":"tools\/call","params":{"name":"echo"}}"#;
         assert_eq!(inspect(body), invalid(RequestDetail::DuplicateKeys));
+    }
+
+    #[test]
+    fn keys_a_server_may_read_as_the_same_member_are_refused() {
+        for body in [
+            // tools/call params
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","Name":"delete"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"NAME":"delete","name":"echo"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","name\u0000":"delete"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","namE":"delete"}}"#,
+            // envelope
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping","Method":"tools/call","params":{"name":"delete"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","METHOD":"tools/call","params":{"name":"delete"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo"},"Params":{"name":"delete"}}"#,
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"echo\"},\"param\u{17f}\":{\"name\":\"delete\"}}",
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo"},"params\u0000":{"name":"delete"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"ID":2,"method":"tools/call","params":{"name":"echo"}}"#,
+            r#"{"jsonrpc":"2.0","JSONRPC":"2.0","id":1,"method":"ping"}"#,
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"\u{130}d\":2,\"method\":\"ping\"}",
+            // a batch element
+            r#"[{"jsonrpc":"2.0","id":1,"method":"ping"},{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"echo","Name":"delete"}}]"#,
+        ] {
+            assert_eq!(
+                inspect(body),
+                invalid(RequestDetail::DuplicateKeys),
+                "{}",
+                body
+            );
+        }
+    }
+
+    #[test]
+    fn keys_a_server_may_read_as_a_missing_member_are_refused() {
+        for body in [
+            // A response to the guard, a request to the server.
+            r#"{"jsonrpc":"2.0","id":1,"result":{},"Method":"tools/call","params":{"name":"delete"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":null,"METHOD":"tools/call","params":{"name":"delete"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":1,"message":"x"},"method\u0000":"tools/call","params":{"name":"delete"}}"#,
+            // A notification to the guard, a request to the server.
+            r#"{"jsonrpc":"2.0","Id":5,"method":"tools/list"}"#,
+            "{\"jsonrpc\":\"2.0\",\"\u{130}d\":5,\"method\":\"tools/list\"}",
+            "{\"jsonrpc\":\"2.0\",\"\u{131}d\":5,\"method\":\"tools/list\"}",
+            // Other members.
+            r#"{"jsonrpc":"2.0","id":1,"Result":{}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping","Error":{}}"#,
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\",\"param\u{17f}\":{}}",
+            r#"{"Jsonrpc":"2.0","jsonrpc":"2.0","id":1,"method":"ping"}"#,
+            // a batch element
+            r#"[{"jsonrpc":"2.0","id":1,"method":"ping"},{"jsonrpc":"2.0","id":2,"result":{},"Method":"tools/call","params":{"name":"delete"}}]"#,
+        ] {
+            let expected = if body.starts_with(r#"{"Jsonrpc""#) {
+                RequestDetail::DuplicateKeys
+            } else {
+                RequestDetail::AmbiguousKeys
+            };
+            assert_eq!(inspect(body), invalid(expected), "{}", body);
+        }
+        // Other members are not compared.
+        for body in [
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping","Ids":1,"meta":{}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{},"methods":"tools/call"}"#,
+        ] {
+            assert_eq!(inspect(body), Ok(Routing::PassThrough), "{}", body);
+        }
+    }
+
+    #[test]
+    fn keys_that_differ_in_case_inside_arguments_are_allowed() {
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fetch","arguments":{"url":"a","URL":"b"}}}"#;
+        assert_eq!(
+            inspect(body),
+            Ok(Routing::Decide {
+                batch: false,
+                requests: vec![call("1", "fetch")],
+            })
+        );
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping","params":{"a":1,"A":2}}"#;
+        assert_eq!(inspect(body), Ok(Routing::PassThrough));
     }
 
     #[test]
@@ -1194,7 +1380,15 @@ mod tests {
     // --- HTTP gate -------------------------------------------------------------------------
 
     fn gate(method: &str, headers: &[(&'static str, &'static str)]) -> Gate {
-        gate_request(method, |name| {
+        gate_with(method, false, headers)
+    }
+
+    fn gate_with(
+        method: &str,
+        body_follows: bool,
+        headers: &[(&'static str, &'static str)],
+    ) -> Gate {
+        gate_request(method, body_follows, |name| {
             headers.iter().find(|(n, _)| *n == name).map(|(_, v)| *v)
         })
     }
@@ -1220,6 +1414,52 @@ mod tests {
                 gate("POST", &[("content-encoding", coding)]),
                 Gate::Refuse(HttpRefusal::Encoded),
                 "{coding}"
+            );
+        }
+    }
+
+    #[test]
+    fn post_is_refused_unless_its_charset_is_utf8() {
+        for content_type in [
+            "application/json",
+            "application/json; charset=utf-8",
+            "application/json;charset=UTF-8",
+            "application/json; charset=\"utf-8\"",
+            "application/json; charset=utf8",
+            "application/json; Charset = utf-8 ; q=1",
+            "text/plain",
+        ] {
+            assert_eq!(
+                gate("POST", &[("content-type", content_type)]),
+                Gate::Inspect,
+                "{content_type}"
+            );
+        }
+        for content_type in [
+            // `express.json()` decodes these with iconv-lite.
+            "application/json; charset=utf-7",
+            "application/json; charset=\"UTF-7\"",
+            "application/json; charset=utf-16le",
+            "application/json; charset=Shift_JIS",
+            "application/json; charset=iso-8859-1",
+            "application/json; charset=",
+            "application/json; charset",
+            "application/json; charset=\"utf-8",
+            "application/json; charset=\"utf-8;x\"",
+            "application/json; charset=utf-8; charset=utf-7",
+            // Repeated headers, joined.
+            "application/json, application/json; charset=utf-7",
+            "application/json; charset=utf-8, text/plain",
+            // A charset some servers find anywhere in the value.
+            "application/json; x=charset=utf-7",
+            "application/jsoncharset=utf-7",
+            "application/json; CHARSET*=utf-8''utf-7",
+            "application/json; char\u{17F}et=utf-7",
+        ] {
+            assert_eq!(
+                gate("POST", &[("content-type", content_type)]),
+                Gate::Refuse(HttpRefusal::Encoded),
+                "{content_type}"
             );
         }
     }
@@ -1251,6 +1491,48 @@ mod tests {
             );
             for name in METHOD_OVERRIDE_HEADERS {
                 assert_eq!(gate(method, &[(name, "POST")]), refused, "{method} {name}");
+            }
+        }
+    }
+
+    #[test]
+    fn bodiless_methods_whose_headers_do_not_end_the_request_pass_only_if_empty() {
+        // Over HTTP/2 and HTTP/3 a body needs no Content-Length.
+        for method in ["GET", "DELETE", "OPTIONS", "HEAD"] {
+            assert_eq!(
+                gate_with(method, true, &[]),
+                Gate::PassThroughIfEmpty,
+                "{method}"
+            );
+            assert_eq!(
+                gate_with(method, true, &[("content-length", "0")]),
+                Gate::PassThroughIfEmpty,
+                "{method}"
+            );
+            assert_eq!(
+                gate_with(method, true, &[("content-length", "5")]),
+                Gate::Refuse(HttpRefusal::MethodNotAllowed),
+                "{method}"
+            );
+        }
+        assert_eq!(gate_with("POST", true, &[]), Gate::Inspect);
+    }
+
+    #[test]
+    fn requests_that_ask_to_upgrade_the_connection_are_refused() {
+        let refused = Gate::Refuse(HttpRefusal::MethodNotAllowed);
+        for method in ["GET", "POST", "DELETE", "OPTIONS", "HEAD"] {
+            for protocol in ["websocket", "WebSocket", "mcp", ""] {
+                assert_eq!(
+                    gate(method, &[("connection", "Upgrade"), ("upgrade", protocol)]),
+                    refused,
+                    "{method} {protocol}"
+                );
+                assert_eq!(
+                    gate(method, &[("upgrade", protocol)]),
+                    refused,
+                    "{method} {protocol}"
+                );
             }
         }
     }

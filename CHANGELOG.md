@@ -36,6 +36,19 @@ All notable changes to this policy are recorded here. The format follows
   limit, an upstream reset or a timeout) left the guard trusting what it had
   learned before. The guard now stops trusting it (`catalog_stale` with
   reason `incomplete`) until it can inspect a list again.
+- After a list the guard couldn't inspect, any list it could inspect made it
+  trust what it had learned about every tool again, also a list that didn't
+  show the tool, such as another page of a paginated list. A caller could
+  list only another page and then call a tool whose class the server had
+  raised in the list the guard couldn't inspect. A tool is now trusted again
+  only once a list the guard inspects shows it, and `catalog.maxAgeSeconds`
+  counts from the last list that showed the tool. After an upgrade from
+  1.0.0, calls are refused `unknown_tool` until an agent lists tools again.
+- With `onUnknownTool: classifyByName`, a tool the guard didn't trust any
+  more was classified by its name only, so after a list the guard couldn't
+  inspect, a destructive tool whose name matched a read rule could be called
+  as read. A tool the guard has learned now gets the higher of its learned
+  class and its name's class.
 - A list starting with a byte-order mark, as JSON or SSE, passed unfiltered,
   and calls to its tools were refused `unknown_tool`. The mark is now accepted
   and kept.
@@ -56,6 +69,51 @@ All notable changes to this policy are recorded here. The format follows
   request instead. If the gateway refuses that error too, the list passes
   unchanged and the guard stops trusting what it learned (`catalog_stale`
   with reason `internal_error`).
+- A request could name one tool to the guard and another to the server when
+  it repeated a key in a form some JSON parsers read as the same key, such as
+  `"name":"search","Name":"delete_all"`. Go's `encoding/json` matches keys
+  regardless of case and keeps the last one. Keys of the message and of a
+  `tools/call`'s `params` that differ only in case or by a NUL are now refused
+  as duplicates (`invalid_request` with detail `duplicate_keys`). In a list
+  response, the same in the message, `result`, a tool entry or `annotations`
+  makes the guard stop trusting what it learned (`catalog_stale` with reason
+  `response_invalid`).
+- A message with a `result` or `error` and a key such as `Method` instead of
+  `method` passed the guard as a response. Servers that match keys
+  regardless of case and take any message with a method for a request, as
+  some Go MCP servers do, ran it as a call. Keys that a server may read as a
+  JSON-RPC member (`jsonrpc`, `id`, `method`, `params`, `result` or `error`)
+  without being one are now refused (`invalid_request` with detail
+  `ambiguous_keys`). Keys are now also compared with `İ` read as `i`, as Go
+  reads it.
+- A request could name one tool to the guard and another to the server when
+  its `Content-Type` named a charset other than UTF-8. The guard reads
+  request bodies as UTF-8, but some servers decode them with the charset the
+  client names: Express's `express.json()`, which the MCP TypeScript SDK
+  uses, reads `+AG4-ame` as `name` in UTF-7. Such requests are now refused
+  (`encoded`, HTTP 415).
+- A request asking to upgrade the connection to a WebSocket passed the guard,
+  and Omni Gateway 1.13.0 forwards such requests. If the server accepted,
+  nothing sent on that connection was checked. Requests with an `Upgrade`
+  header are now refused (`method_not_allowed`, HTTP 405).
+- Over HTTP/2 and HTTP/3, a GET, DELETE, OPTIONS or HEAD request can carry a
+  body without a `Content-Length` header. Such a body passed the guard
+  unchecked and reached the server. These requests now pass only if their
+  body is empty, and are refused otherwise (`method_not_allowed`, HTTP 405).
+- Every `tools/call` decoded the whole catalog the guard had learned, and
+  read it from the gateway's shared store one byte at a time, so large
+  catalogs slowed every call: with 5,000 tools (the default
+  `limits.maxCachedTools`), the guard added about 9 ms per call. A call now
+  reads the catalog in one piece and decodes it only when another worker has
+  changed it; with 5,000 tools the guard adds under 0.5 ms at p99. Catalogs
+  are stored in the same format as before.
+- Repeated warnings were limited to one a minute per event type and catalog,
+  so one warning could hide another that said something else: a malformed
+  request hid a request refused for duplicate keys right after it, and an
+  attempt to lower one tool's class hid an attempt on another tool. Warnings
+  are now limited per reason (`request_rejected`, `catalog_stale`), limit
+  (`pin_capacity_exhausted`) or tool (`classification_downgrade_ignored`,
+  `tool_definition_conflict`).
 
 ### Changed
 

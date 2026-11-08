@@ -30,7 +30,10 @@ use serde_json::Value;
 use crate::catalog::Pin;
 use crate::classify::{classify_tool, Classified, Outcome};
 use crate::config::{Class, Config};
-use crate::envelope::{check_strict_json, is_identity_encoding, parse_message, Kind, StrictError};
+use crate::envelope::{
+    check_strict_json, has_folded_duplicates, is_identity_encoding, is_utf8_label, parse_message,
+    Kind, StrictError,
+};
 use crate::freshness::StaleReason;
 use crate::ids::{self, Id};
 
@@ -71,16 +74,6 @@ enum MediaType {
     EventStream,
 }
 
-/// The WHATWG Encoding labels for UTF-8.
-const UTF8_LABELS: [&str; 6] = [
-    "unicode-1-1-utf-8",
-    "unicode11utf8",
-    "unicode20utf8",
-    "utf-8",
-    "utf8",
-    "x-unicode20utf8",
-];
-
 /// Parses `type/subtype; params` (case-insensitive); `charset` must be absent
 /// or a UTF-8 label, other parameters are ignored.
 fn media_type(value: &str) -> Option<MediaType> {
@@ -91,10 +84,7 @@ fn media_type(value: &str) -> Option<MediaType> {
         let key = kv.next().unwrap_or_default().trim();
         if key.eq_ignore_ascii_case("charset") {
             let charset = kv.next().unwrap_or_default().trim().trim_matches('"');
-            if !UTF8_LABELS
-                .iter()
-                .any(|label| charset.eq_ignore_ascii_case(label))
-            {
+            if !is_utf8_label(charset) {
                 return None;
             }
         }
@@ -278,6 +268,9 @@ fn inspect_result(source: &str, result: &RawValue, config: &Config) -> Result<Ta
     }
     let members: BTreeMap<String, &RawValue> =
         serde_json::from_str(result.get()).map_err(|_| invalid)?;
+    if has_folded_duplicates(members.keys()) {
+        return Err(invalid);
+    }
     let tools = members.get("tools").ok_or(invalid)?;
     if tools.get().as_bytes().first() != Some(&b'[') {
         return Err(invalid);
@@ -287,7 +280,7 @@ fn inspect_result(source: &str, result: &RawValue, config: &Config) -> Result<Ta
     for item in items {
         entries.push(Entry {
             range: range_in(source, item.get())?,
-            tool: entry_tool(item, config),
+            tool: entry_tool(item, config)?,
         });
     }
     // A filtered list is meant for one caller only, so any other value
@@ -307,22 +300,48 @@ fn inspect_result(source: &str, result: &RawValue, config: &Config) -> Result<Ta
     })
 }
 
-/// Validates and classifies one entry; `None` if invalid.
-fn entry_tool(item: &RawValue, config: &Config) -> Option<Tool> {
+/// Validates and classifies one entry; `None` if invalid. An entry or
+/// `annotations` object with keys a client may read as the same member
+/// (`"name"` and `"Name"`) makes the whole response invalid, like an exact
+/// duplicate does.
+fn entry_tool(item: &RawValue, config: &Config) -> Result<Option<Tool>, StaleReason> {
     if item.get().as_bytes().first() != Some(&b'{') {
-        return None;
+        return Ok(None);
     }
-    let members: BTreeMap<String, &RawValue> = serde_json::from_str(item.get()).ok()?;
-    let name: String = serde_json::from_str(members.get("name")?.get()).ok()?;
+    let Ok(members) = serde_json::from_str::<BTreeMap<String, &RawValue>>(item.get()) else {
+        return Ok(None);
+    };
+    let annotations = members.get("annotations");
+    if has_folded_duplicates(members.keys())
+        || annotations.is_some_and(|raw| object_has_folded_duplicates(raw))
+    {
+        return Err(StaleReason::ResponseInvalid);
+    }
+    let Some(Ok(name)) = members
+        .get("name")
+        .map(|raw| serde_json::from_str::<String>(raw.get()))
+    else {
+        return Ok(None);
+    };
     if name.len() > config.limits.max_tool_name_bytes {
-        return None;
+        return Ok(None);
     }
-    let annotations: Option<Value> = match members.get("annotations") {
-        Some(raw) => Some(serde_json::from_str(raw.get()).ok()?),
+    let annotations: Option<Value> = match annotations {
+        Some(raw) => match serde_json::from_str(raw.get()) {
+            Ok(value) => Some(value),
+            Err(_) => return Ok(None),
+        },
         None => None,
     };
     let classified = classify_tool(&name, annotations.as_ref(), config);
-    Some(Tool { name, classified })
+    Ok(Some(Tool { name, classified }))
+}
+
+/// `true` if `raw` is an object with keys a client may read as the same member.
+fn object_has_folded_duplicates(raw: &RawValue) -> bool {
+    raw.get().as_bytes().first() == Some(&b'{')
+        && serde_json::from_str::<BTreeMap<String, &RawValue>>(raw.get())
+            .is_ok_and(|members| has_folded_duplicates(members.keys()))
 }
 
 impl ListResult {
@@ -710,6 +729,37 @@ mod tests {
         for (body, expected) in cases {
             assert_eq!(outcome(body, &["1"]), expected, "{body}");
         }
+    }
+
+    #[test]
+    fn keys_a_client_may_read_as_the_same_member_mark_stale() {
+        for body in [
+            r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]},"Result":{"tools":[]}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"ID":2,"result":{"tools":[]}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[],"Tools":[]}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"a","Name":"b"}]}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"a","name\u0000":"b"}]}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"a","annotations":{"readOnlyHint":true},"Annotations":{}}]}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"a","annotations":{"readOnlyHint":true,"ReadOnlyHint":false}}]}}"#,
+        ] {
+            assert_eq!(
+                outcome(body, &["1"]),
+                Inspection::Stale(StaleReason::ResponseInvalid),
+                "{}",
+                body
+            );
+        }
+    }
+
+    #[test]
+    fn keys_that_differ_in_case_inside_a_schema_are_allowed() {
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"fetch","inputSchema":{"type":"object","properties":{"url":{},"URL":{}}},"annotations":{"readOnlyHint":true}}]}}"#;
+        let list = lists(body, &["1"], &config(json!({})));
+        assert_eq!(
+            list.tools().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            ["fetch"]
+        );
+        assert_eq!(list.invalid_entries(), 0);
     }
 
     #[test]

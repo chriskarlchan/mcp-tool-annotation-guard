@@ -12,6 +12,10 @@
 //!   right after the merge, so an entry is shown iff calling it would be
 //!   allowed. Tools that stay unknown (capacity, or a catalog still stale
 //!   because of a later failure) are hidden under `onUnknownTool: deny`.
+//! - Under `onUnknownTool: classifyByName`, a pin that must not be trusted
+//!   still sets the lowest class: the tool gets the higher of its pin and
+//!   its name's class. A catalog any caller can make stale (a list it cuts
+//!   off) must never lower a class.
 
 use std::collections::BTreeSet;
 
@@ -99,6 +103,9 @@ pub fn grants_providing(config: &Config, class: Class) -> Vec<&str> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CatalogView {
     pub pin: Option<Pin>,
+    /// The pin must not be trusted: no list the guard inspected has shown
+    /// the tool since the catalog's last failure (or within
+    /// `catalog.maxAgeSeconds`).
     pub stale: bool,
 }
 
@@ -106,7 +113,8 @@ pub struct CatalogView {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Basis {
     Override,
-    /// A pin in a fresh catalog.
+    /// A pin: a trusted one, or under `classifyByName` one that must not be
+    /// trusted but is higher than the name's class.
     Pin(Source),
     /// An unknown tool under `onUnknownTool: classifyByName`.
     ByName(Source),
@@ -154,9 +162,15 @@ pub fn effective_class(name: &str, config: &Config, view: CatalogView) -> Effect
         OnUnknownTool::Deny => Effective::Unknown,
         OnUnknownTool::ClassifyByName => {
             let (class, source) = by_name(name, &config.classification);
-            Effective::Known {
-                class,
-                basis: Basis::ByName(source),
+            match view.pin {
+                Some(pin) if pin.class > class => Effective::Known {
+                    class: pin.class,
+                    basis: Basis::Pin(pin.source),
+                },
+                _ => Effective::Known {
+                    class,
+                    basis: Basis::ByName(source),
+                },
             }
         }
     }
@@ -579,21 +593,50 @@ mod tests {
         );
         assert!(decide_call("search", &c, &reader, stale(Class::Destructive)).is_allowed());
 
-        let by_name = config(
-            json!({"onUnknownTool": "classifyByName", "nameRules": [{"pattern": ".", "class": "read"}]}),
+        let by_name = config(json!({
+            "onUnknownTool": "classifyByName",
+            "nameRules": [{"pattern": "^get_", "class": "read"}],
+            "unannotatedAs": "write"
+        }));
+        let reader = caller(&by_name, &[]);
+        let by_name_writer = config(json!({
+            "onUnknownTool": "classifyByName",
+            "nameRules": [{"pattern": "^get_", "class": "read"}],
+            "unannotatedAs": "write",
+            "grants": [{"attribute": "w", "level": "write"}]
+        }));
+        let writer = caller(&by_name_writer, &["w"]);
+        assert_eq!(
+            decide_call("get_records", &by_name, &reader, stale(Class::Destructive)),
+            CallDecision::Deny(Refusal {
+                reason: Reason::LevelInsufficient,
+                tool: "get_records".to_owned(),
+                caller_level: Level::Read,
+                class: Some(Class::Destructive),
+            }),
+            "while stale, a pin above the name's class is kept"
         );
         assert_eq!(
-            decide_call(
-                "t",
-                &by_name,
-                &caller(&by_name, &[]),
-                stale(Class::Destructive)
-            ),
+            decide_call("get_records", &by_name, &reader, stale(Class::Read)),
             CallDecision::Allow {
                 class: Class::Read,
                 basis: Basis::ByName(Source::NameRule)
+            }
+        );
+        assert_eq!(
+            decide_call("set_x", &by_name_writer, &writer, stale(Class::Read)),
+            CallDecision::Allow {
+                class: Class::Write,
+                basis: Basis::ByName(Source::Default)
             },
-            "while stale, the pin is ignored (classifyByName applies)"
+            "a name class above the pin applies"
+        );
+        assert_eq!(
+            decide_call("get_records", &by_name_writer, &writer, stale(Class::Write)),
+            CallDecision::Allow {
+                class: Class::Write,
+                basis: Basis::Pin(Source::Annotations)
+            }
         );
     }
 

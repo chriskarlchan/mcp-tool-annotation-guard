@@ -33,9 +33,7 @@ use pdk::script::{HandlerAttributesBinding, Script, Value as ScriptValue};
 
 use guard_core::catalog::{self, CatalogSettings, Catalogs, PartitionUnavailable};
 use guard_core::config::Config;
-use guard_core::decide::{
-    self, Action, CallDecision, Caller, CatalogView, ElementDecision, Lookup,
-};
+use guard_core::decide::{self, Action, CallDecision, Caller, ElementDecision, Lookup};
 use guard_core::envelope::{self, CallCheck, EnvelopeLimits, Gate, RequestElement, Routing};
 use guard_core::ids::Id;
 use guard_core::list::{self, Env, Outcome, Pending};
@@ -231,10 +229,7 @@ impl Policy {
             let catalog = key.as_ref().ok().map(|key| catalogs.read(key));
             decide::decide_requests(requests, &self.config, caller, |name| match catalog {
                 None => Lookup::PartitionUnavailable,
-                Some(catalog) => Lookup::Catalog(CatalogView {
-                    pin: catalog.pin(name),
-                    stale: catalog.is_stale(now, max_age_seconds),
-                }),
+                Some(catalog) => Lookup::Catalog(catalog.view(name, now, max_age_seconds)),
             })
         };
 
@@ -394,8 +389,18 @@ async fn request_filter(
     };
 
     // Method rules.
-    match envelope::gate_request(&state.method(), |name| headers.get(name)) {
+    match envelope::gate_request(&state.method(), state.contains_body(), |name| {
+        headers.get(name)
+    }) {
         Gate::PassThrough => return Flow::Continue(None),
+        Gate::PassThroughIfEmpty => {
+            let state = state.into_headers_body_state().await;
+            return if state.handler().body().is_empty() {
+                Flow::Continue(None)
+            } else {
+                policy.reject(envelope::HttpRefusal::MethodNotAllowed.into(), &info)
+            };
+        }
         Gate::Refuse(refusal) => return policy.reject(refusal.into(), &info),
         Gate::Inspect => {}
     }

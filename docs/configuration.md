@@ -32,11 +32,11 @@ For every call, the guard answers two questions: **what class is the tool**, and
 
 1. **Blocked tools**: refused for everyone, always hidden.
 2. **Tool class overrides**: the class you set.
-3. **The tool's annotations**: `readOnlyHint: true` → read; `destructiveHint: false` → write; anything else → destructive. While the gateway runs, a tool's class can rise but is never lowered by what the server later says (rug-pull protection).
-4. **Name rules**, only for tools with no annotations: the first pattern that matches.
+3. **The tool's annotations**, when the tool has an `annotations` object: `readOnlyHint: true` → read; `destructiveHint: false` → write; anything else → destructive, also an object with neither hint, as the MCP specification's defaults say. While the gateway runs, a tool's class can rise but is never lowered by what the server later says (rug-pull protection).
+4. **Name rules**, only for tools without an `annotations` object (missing, `null` or not an object): the first pattern that matches.
 5. **Class for tools without annotations**: destructive by default.
 
-A call to a tool the guard hasn't seen in a list yet is refused `unknown_tool`, and the agent is told to list tools again. With **Calls to tools not seen in a list** set to `classifyByName`, steps 4 and 5 decide instead.
+A call to a tool the guard hasn't seen in a list yet is refused `unknown_tool`, and the agent is told to list tools again. With **Calls to tools not seen in a list** set to `classifyByName`, steps 4 and 5 decide instead. The same applies to a tool the guard has seen but doesn't trust right now (after a list it couldn't inspect), except that the tool keeps at least the class it learned. Tool names are compared exactly, so `Delete_All` is a tool the guard hasn't seen even when it has seen `delete_all`; keep `deny` if your server looks tool names up regardless of case.
 
 **The caller's level** is the highest of the **Default access level** and every grant the caller matches. Grants only raise a level; nothing lowers it.
 
@@ -45,27 +45,27 @@ A call to a tool the guard hasn't seen in a list yet is refused `unknown_tool`, 
 - Name rules never override real annotations. To correct an annotated tool, use a tool class override (example H).
 - A tool can't be both blocked and overridden; that is a configuration error.
 - **Default access level** `none` plus grants turns the guard into an allow-list of callers (example C).
-- **Mode** `audit` works with any configuration: the decisions are the same, but they are only logged.
+- **Mode** `audit` works with any configuration: the decisions are the same, but they are only logged. Requests the guard would refuse as protocol errors (duplicate keys or a WebSocket upgrade, for example) are forwarded too, so audit mode protects nothing; use it to try a configuration, not to run one.
 - **Hide tools the caller can't use** off still checks every call; it only stops hiding tools from lists.
 
 ## Top-level properties
 
 | Property | In the form | Type | Default | Description |
 |---|---|---|---|---|
-| `mode` | Mode | `enforce` \| `audit` | `enforce` | `audit` refuses nothing and filters nothing; it logs a `would_deny` event for every refusal it would have made. |
+| `mode` | Mode | `enforce` \| `audit` | `enforce` | `audit` refuses nothing and filters nothing; it logs a `would_deny` event for every refusal it would have made, protocol errors included. |
 | `defaultLevel` | Default access level | `none` \| `read` \| `write` \| `destructive` | `read` | Access level every caller gets before grants. `none` means no tools. |
 | `callerAttributes` | Caller roles or scopes | DataWeave expression | unset | Returns the caller's attributes: a string or an array of strings, taken from identity an earlier policy verified. See [Caller attributes](#caller-attributes). |
 | `callerAttributeSeparator` | Separator for a single-string claim | string | unset | Splits a single-string result, for example `" "` for an OAuth `scope` claim. |
 | `grants` | Grants (role to access level) | array of grant objects | `[]` | Raise the caller's level when they have a given attribute. The highest matching grant wins. |
 | `blockedTools` | Blocked tools | array of strings | `[]` | Tool names refused for every caller and always hidden. |
 | `toolOverrides` | Tool class overrides | array of override objects | `[]` | Admin classification. Wins over annotations and is never lowered or raised by what the server says. The tool counts as known even before it is listed. |
-| `unannotatedAs` | Class for tools without annotations | `read` \| `write` \| `destructive` | `destructive` | Class for tools that have no annotations and match no name rule. |
-| `nameRules` | Name rules for tools without annotations | ordered array of name-rule objects | `[]` | Classify unannotated tools by name. Never overrides real annotations. |
+| `unannotatedAs` | Class for tools without annotations | `read` \| `write` \| `destructive` | `destructive` | Class for tools that have no `annotations` object and match no name rule. A tool whose annotations declare neither hint is destructive whatever this says. |
+| `nameRules` | Name rules for tools without annotations | ordered array of name-rule objects | `[]` | Classify tools that have no `annotations` object by name. Never overrides annotations, even ones that declare neither hint. |
 | `onUnknownTool` | Calls to tools not seen in a list | `deny` \| `classifyByName` | `deny` | What to do with a call for a tool the guard hasn't seen in a list. `classifyByName` uses the first matching name rule, else `unannotatedAs`. |
 | `filterToolsList` | Hide tools the caller can't use | boolean | `true` | `false` enforces calls only; the guard still learns from lists. |
 | `strictContradictions` | Treat contradictory annotations as destructive | boolean | `false` | When `true`, a tool that says both `readOnlyHint: true` and `destructiveHint: true` is destructive instead of read. |
 | `logging` | Logging | object | | See [`logging`](#logging). |
-| `catalogPartition` | Advanced: tool catalog per tenant | DataWeave expression | unset | Separates what the guard learns per partition (for example per tenant), for servers that show different tools to different callers. **Fails closed**: if set but it returns no usable string, calls are refused (`partition_unavailable`) and lists come back empty. |
+| `catalogPartition` | Advanced: tool catalog per tenant | DataWeave expression | unset | Separates what the guard learns per partition (for example per tenant), for servers that show different tools to different callers. Read it from verified identity, such as a tenant ID claim, that also decides which tools the server shows: a caller who can choose its partition decides with another tenant's catalog. **Fails closed**: if set but it returns no usable string, calls are refused (`partition_unavailable`), and while filtering is active lists come back empty. |
 | `denial` | Advanced: refusal format | object | | See [`denial`](#denial). |
 | `catalog` | Advanced: tool catalog expiry | object | | See [`catalog`](#catalog). |
 | `limits` | Advanced: size limits | object | | See [`limits`](#limits). |
@@ -100,7 +100,7 @@ Rules are tried in order; the first match wins.
 | Property | In the form | Type | Default | Description |
 |---|---|---|---|---|
 | `logAllowedCalls` | Log allowed calls | boolean | `false` | Log a `call_allowed` debug event for every allowed call. |
-| `logCallerAttributes` | Include caller roles in log events | boolean | `false` | Include caller attributes in log events. Off by default; tokens, claims, tool arguments and results are never logged. |
+| `logCallerAttributes` | Include caller roles in log events | boolean | `false` | Include caller attributes in log events. Off by default. Tokens, tool arguments and results are never logged, and no claims other than these attributes. |
 
 ### `denial`
 
@@ -117,7 +117,7 @@ Rules are tried in order; the first match wins.
 
 | Property | In the form | Type | Default | Description |
 |---|---|---|---|---|
-| `maxAgeSeconds` | Maximum catalog age (seconds) | integer ≥ 0 | `0` (off) | When > 0, what the guard learned expires this many seconds after the last inspected list, and calls are refused `unknown_tool` until the agent re-lists. Most clients list once per session, so leave it off unless you want periodic re-listing. |
+| `maxAgeSeconds` | Maximum catalog age (seconds) | integer ≥ 0 | `0` (off) | When > 0, what the guard learned about a tool expires this many seconds after the last inspected list that showed it, and calls to it are refused `unknown_tool` until the agent re-lists. Each page of a paginated list renews only its own tools. Most clients list once per session, so leave it off unless you want periodic re-listing. |
 
 ### `limits`
 
@@ -130,6 +130,8 @@ Rules are tried in order; the first match wins.
 | `maxCachedTools` | Maximum tools remembered per catalog | integer ≥ 1 | `5000` | Tools remembered per catalog. When full, new tools stay unknown (fail closed); nothing is evicted. |
 | `maxCatalogBytes` | Maximum catalog size (bytes) | integer ≥ 4096 | `524288` | Size limit per catalog, with the same fail-closed behaviour. |
 | `maxCatalogs` | Maximum catalogs kept | integer ≥ 1 | `1000` | Catalogs per API instance and configuration: one per partition, or a single one without `catalogPartition`. Nothing is evicted. When the limit is reached, a new partition's catalog is refused, its tools stay unknown, and its calls are refused `unknown_tool` (fail closed). |
+
+**Memory.** The gateway keeps each catalog once, in memory its workers share, at most `maxCatalogBytes`. Each worker that handles a catalog's calls also keeps its own copy, up to about three times that size: about 1 MB for a catalog of 5,000 tools. One catalog per API instance needs little; with `catalogPartition`, plan memory for the partitions you expect, or lower `maxCatalogs` or `maxCatalogBytes`.
 
 ## Caller attributes
 
@@ -202,11 +204,11 @@ Policy refusals use `denial.errorCode` (default `-32008`) and `denial.httpStatus
 |---|---|
 | `level_insufficient` | The tool's class is above the caller's level. |
 | `tool_blocked` | The tool is in `blockedTools`. |
-| `unknown_tool` | The guard hasn't seen the tool in a list it could inspect (or its knowledge is stale). The message tells the agent to call `tools/list` and retry. |
+| `unknown_tool` | The guard hasn't seen the tool in a list it could inspect, or not since a list it couldn't inspect. The message tells the agent to call `tools/list` and retry. |
 | `partition_unavailable` | `catalogPartition` is set but returned no usable value. |
 | `batch_rejected` | A JSON-RPC batch contains a call that isn't permitted. |
 
-Requests the guard can't safely interpret get JSON-RPC protocol errors with `data.reason` and `data.detail`: `parse_error` (400), `invalid_request` (400), `invalid_params` (200), `too_large` (413), `encoded` (415, compressed request bodies), `method_not_allowed` (405) and `internal_error` (500). All guard responses set `Cache-Control: no-store`. If the client accepts only `text/event-stream`, the response is sent as one SSE event.
+Requests the guard can't safely interpret get JSON-RPC protocol errors with `data.reason` and `data.detail`: `parse_error` (400), `invalid_request` (400), `invalid_params` (200), `too_large` (413), `encoded` (415, compressed request bodies and bodies whose `Content-Type` names a charset other than UTF-8), `method_not_allowed` (405: methods other than POST, GET, DELETE, OPTIONS and HEAD, a body on any of the last four, and requests that ask to upgrade the connection, such as to a WebSocket) and `internal_error` (500). All guard responses set `Cache-Control: no-store`. If the client accepts only `text/event-stream`, the response is sent as one SSE event.
 
 ## Logs
 
@@ -215,14 +217,22 @@ The guard writes one JSON event per line through the gateway's runtime log. To s
 | Event | Level | When |
 |---|---|---|
 | `call_denied` | info | A call was refused. |
-| `would_deny` | info | Audit mode: a call would have been refused. |
+| `call_allowed` | debug | A call was allowed (only with `logAllowedCalls`). |
+| `would_deny` | info | Audit mode: a call or request would have been refused (`reason` as in `call_denied` or `request_rejected`). |
 | `list_filtered` | info | Tools were hidden from a list (up to 50 names). |
+| `tool_classified` | debug | A tool in a list was classified (`class`, `source`, and `idempotentHint` and `openWorldHint` if the tool declares them). |
 | `classification_upgraded` | info | A tool's class was raised. |
 | `classification_downgrade_ignored` | warn | A server tried to lower a tool's class (possible rug pull). |
-| `catalog_stale` / `catalog_fresh` | warn / info | The guard stopped / resumed trusting what it learned. |
+| `tool_definition_conflict` | warn | A list showed one tool name more than once with different classes; the highest applies to every entry. |
+| `annotations_contradictory` | info | A tool declares both `readOnlyHint: true` and `destructiveHint: true`: read, or destructive with `strictContradictions`. |
+| `annotations_malformed` | warn | A hint is not `true` or `false` (`field`); it is read as missing. |
+| `list_entry_invalid` | warn | Entries of a list weren't a tool the guard can read, such as an entry without a string `name` or with one over `maxToolNameBytes` (`count`); they are removed from filtered lists and never learned. |
+| `catalog_stale` / `catalog_fresh` | warn / info | The guard stopped trusting what it learned / inspected a list again. Each tool is trusted again once a list shows it. |
 | `request_rejected` | warn | A protocol error was returned. |
 | `pin_capacity_exhausted` | warn | A limit was reached (`limit`: `maxCachedTools`, `maxCatalogBytes` or `maxCatalogs`); the tools concerned stay unknown. |
 | `catalog_merge_retry_exhausted` | warn | What this worker learned is kept by this worker only, until a later save succeeds: other workers kept saving at the same moment, the shared store couldn't be read or written, or `maxCatalogs` was reached after this worker started using the catalog. |
 | `partition_unavailable` | warn | `catalogPartition` returned no usable value. |
+| `caller_attributes_unavailable` | debug | `callerAttributes` returned nothing usable; the caller has `defaultLevel`. |
+| `limits_configured` | info | At start-up: the configured `limits`, to compare with the gateway's buffer limit. |
 
-Repeated warnings of the same type are limited to one per minute per catalog.
+Each gateway worker logs a repeated warning at most once a minute: the same event for the same catalog, about the same thing. A warning about something else is still logged: `request_rejected` and `catalog_stale` with another reason or detail, `pin_capacity_exhausted` with another limit, and `classification_downgrade_ignored` and `tool_definition_conflict` for another tool.

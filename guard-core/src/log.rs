@@ -24,8 +24,8 @@ use crate::response::{ProtocolError, POLICY_NAME};
 pub const MAX_LOGGED_BYTES: usize = 128;
 /// Most names in one list field.
 pub const MAX_LOGGED_NAMES: usize = 50;
-/// Repeated `warn` events of one type for one catalog: at most one per this
-/// interval.
+/// Repeated `warn` events about the same thing: at most one per this
+/// interval (see [`WarnLimiter`]).
 pub const WARN_INTERVAL_MS: u64 = 60_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -195,6 +195,25 @@ impl<'a> Event<'a> {
             | Event::PinCapacityExhausted(_)
             | Event::CatalogMergeRetryExhausted
             | Event::PartitionUnavailable => LogLevel::Warn,
+        }
+    }
+
+    /// What a `warn` event is about, beyond its type and catalog, for the
+    /// rate limit: one warning can't hide another that says something else,
+    /// such as a request refused for another reason, or an attempt to lower
+    /// another tool's class. Warnings about the quality of a server's list
+    /// share one slot per type, so a careless server can't flood the log.
+    pub fn limit_subject(&self) -> String {
+        match *self {
+            Event::RequestRejected(err) => match err.detail() {
+                Some(detail) => format!("{}/{detail}", err.reason()),
+                None => err.reason().to_owned(),
+            },
+            Event::CatalogStale(reason) => reason.as_str().to_owned(),
+            Event::PinCapacityExhausted(limit) => limit.as_str().to_owned(),
+            Event::ClassificationDowngradeIgnored { tool, .. }
+            | Event::ToolDefinitionConflict { tool, .. } => tool.to_owned(),
+            _ => String::new(),
         }
     }
 
@@ -395,11 +414,12 @@ fn push_json_string(out: &mut String, value: &str) {
     out.push('"');
 }
 
-/// Limits repeated `warn` events of one type for one catalog to one per
-/// [`WARN_INTERVAL_MS`]. Each worker has its own limiter.
+/// Limits repeated `warn` events about the same thing to one per
+/// [`WARN_INTERVAL_MS`]: the same type, catalog and subject (see
+/// [`Event::limit_subject`]). Each worker has its own limiter.
 #[derive(Debug)]
 pub struct WarnLimiter {
-    last: HashMap<(&'static str, String), u64>,
+    last: HashMap<(&'static str, String, String), u64>,
     capacity: usize,
 }
 
@@ -421,14 +441,19 @@ impl WarnLimiter {
     }
 
     /// Whether to log `event` now. `catalog` is the catalog key, if the
-    /// event concerns one; events without a catalog share one slot per type.
-    /// Non-warn events are always logged. A clock that moved backwards
-    /// resets the interval rather than suppressing until it catches up.
+    /// event concerns one; events without a catalog share one slot per type
+    /// and subject. Non-warn events are always logged. A clock that moved
+    /// backwards resets the interval rather than suppressing until it
+    /// catches up.
     pub fn allow(&mut self, event: &Event<'_>, catalog: Option<&str>, now_ms: u64) -> bool {
         if event.level() != LogLevel::Warn {
             return true;
         }
-        let key = (event.name(), catalog.unwrap_or_default().to_owned());
+        let key = (
+            event.name(),
+            catalog.unwrap_or_default().to_owned(),
+            event.limit_subject(),
+        );
         if let Some(&last) = self.last.get(&key) {
             if now_ms >= last && now_ms - last < WARN_INTERVAL_MS {
                 return false;
@@ -844,7 +869,7 @@ mod tests {
         assert!(limiter.allow(&stale, Some("k1"), 1_000));
         assert!(!limiter.allow(&stale, Some("k1"), 1_000 + WARN_INTERVAL_MS - 1));
         assert!(
-            !limiter.allow(
+            limiter.allow(
                 &Event::CatalogStale(StaleReason::TooLarge),
                 Some("k1"),
                 2_000
@@ -870,6 +895,58 @@ mod tests {
         assert!(limiter.allow(&stale, Some("k"), 500_000));
         assert!(limiter.allow(&stale, Some("k"), 100_000));
         assert!(!limiter.allow(&stale, Some("k"), 100_001));
+    }
+
+    #[test]
+    fn one_warning_does_not_hide_another_that_says_something_else() {
+        let mut limiter = WarnLimiter::new(100);
+        // A junk request first does not hide a smuggling attempt after it.
+        let parse = ProtocolError::Parse;
+        let duplicate =
+            ProtocolError::InvalidRequest(crate::envelope::RequestDetail::DuplicateKeys);
+        let ambiguous =
+            ProtocolError::InvalidRequest(crate::envelope::RequestDetail::AmbiguousKeys);
+        assert!(limiter.allow(&Event::RequestRejected(&parse), None, 0));
+        assert!(limiter.allow(&Event::RequestRejected(&duplicate), None, 1));
+        assert!(limiter.allow(&Event::RequestRejected(&ambiguous), None, 2));
+        assert!(!limiter.allow(&Event::RequestRejected(&duplicate), None, 3));
+        assert!(!limiter.allow(&Event::RequestRejected(&parse), None, 4));
+
+        // Lowering a harmless tool first does not hide lowering another.
+        let lowered = |tool| Event::ClassificationDowngradeIgnored {
+            tool,
+            pinned: Class::Destructive,
+            observed: Class::Read,
+        };
+        assert!(limiter.allow(&lowered("echo"), Some("k"), 0));
+        assert!(limiter.allow(&lowered("delete_all"), Some("k"), 1));
+        assert!(!limiter.allow(&lowered("delete_all"), Some("k"), 2));
+        let conflict = |tool| Event::ToolDefinitionConflict {
+            tool,
+            classes: &[Class::Read, Class::Destructive],
+        };
+        assert!(limiter.allow(&conflict("echo"), Some("k"), 0));
+        assert!(limiter.allow(&conflict("delete_all"), Some("k"), 1));
+        assert!(!limiter.allow(&conflict("delete_all"), Some("k"), 2));
+
+        assert!(limiter.allow(
+            &Event::PinCapacityExhausted(CapacityLimit::MaxCachedTools),
+            Some("k"),
+            0
+        ));
+        assert!(limiter.allow(
+            &Event::PinCapacityExhausted(CapacityLimit::MaxCatalogs),
+            Some("k"),
+            1
+        ));
+
+        // Warnings about the quality of a list share one slot per type.
+        let malformed = |tool| Event::AnnotationsMalformed {
+            tool,
+            field: "readOnlyHint",
+        };
+        assert!(limiter.allow(&malformed("a"), Some("k"), 0));
+        assert!(!limiter.allow(&malformed("b"), Some("k"), 1));
     }
 
     #[test]

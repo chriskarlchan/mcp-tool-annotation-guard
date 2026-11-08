@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Monotonic pins and the catalog store behind a `Store` trait.
 //!
-//! A [`Catalog`] maps tool names to pins plus two freshness timestamps.
+//! A [`Catalog`] maps tool names to pins plus two freshness timestamps, and
+//! records for each tool the last success whose list showed it.
 //! [`Catalogs`] keeps a shared copy of each catalog in a [`Store`] (local
 //! Data Storage in the policy crate) and a worker-local copy. Merging is a
-//! per-tool `max`, a union of tools and a `max` of each timestamp, so it is
+//! per-tool `max` (of the pin and of the time it was listed), a union of
+//! tools and a `max` of each timestamp, so it is
 //! commutative, associative and idempotent below capacity, and repeated
 //! merges converge.
 //!
@@ -23,7 +25,9 @@
 //!   copy is always the copy merged into, so every worker keeps the same
 //!   pins.
 //! - A shared copy that cannot be read completely (another encoding) is
-//!   never overwritten.
+//!   never overwritten. A copy in the previous encoding, which has no listing
+//!   times, is read with none: its pins are kept, and each is trusted again
+//!   once a list shows its tool.
 
 use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
@@ -36,6 +40,7 @@ use sha2::{Digest, Sha256};
 
 use crate::classify::Source;
 use crate::config::{Class, Classification, Config};
+use crate::decide::CatalogView;
 use crate::freshness::Freshness;
 
 /// The most restrictive candidate class observed for a tool.
@@ -94,29 +99,59 @@ pub enum PinChange {
     NotPinned(CapacityLimit),
 }
 
+/// One tool in a catalog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Entry {
+    pin: Pin,
+    /// The last success whose list showed the tool.
+    listed_at: Option<u64>,
+}
+
 /// One catalog: pins and freshness (the stored catalog value).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Catalog {
-    tools: BTreeMap<String, Pin>,
+    tools: BTreeMap<String, Entry>,
     freshness: Freshness,
     /// Bytes the tools add to the encoding (an upper bound).
     tools_len: usize,
 }
 
 /// Version of the encoding stored in the shared store.
-const ENCODING_VERSION: u8 = 1;
+const ENCODING_VERSION: u8 = 2;
+/// The previous encoding (pins without listing times), still read.
+const PINS_ONLY_VERSION: u8 = 1;
+/// Version of the catalog index encoding.
+const INDEX_VERSION: u8 = 1;
 /// Upper bound for the encoding without tools:
-/// `{"v":1,"s":<20 digits>,"f":<20 digits>,"t":{}}` is 63 bytes.
+/// `{"v":2,"s":<20 digits>,"f":<20 digits>,"t":{}}` is 63 bytes.
 const BASE_LEN: usize = 64;
 
-/// Upper bound for one tool in the encoding: `"<escaped name>":"xy",`.
+/// Upper bound for one tool in the encoding:
+/// `"<escaped name>":["xy",<20 digits>],`.
 fn entry_len(name: &str) -> usize {
-    serde_json::to_string(name).map_or(name.len() * 6 + 2, |quoted| quoted.len()) + 6
+    serde_json::to_string(name).map_or(name.len() * 6 + 2, |quoted| quoted.len()) + 29
 }
 
 impl Catalog {
+    /// The tool's pin, also while it must not be trusted (see [`Catalog::view`]).
     pub fn pin(&self, name: &str) -> Option<Pin> {
-        self.tools.get(name).copied()
+        self.tools.get(name).map(|entry| entry.pin)
+    }
+
+    /// What a decision about `name` may use: its pin, and whether the pin
+    /// must not be trusted. A pin is trusted only if a list the guard
+    /// inspected showed the tool after the catalog's last failure (and
+    /// within `catalog.maxAgeSeconds`), so a success for a list without the
+    /// tool, such as a later page, does not make it trusted again.
+    pub fn view(&self, name: &str, now_ms: u64, max_age_seconds: u64) -> CatalogView {
+        let entry = self.tools.get(name);
+        CatalogView {
+            pin: entry.map(|entry| entry.pin),
+            stale: !entry.is_some_and(|entry| {
+                self.freshness
+                    .trusts(entry.listed_at, now_ms, max_age_seconds)
+            }),
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -148,11 +183,22 @@ impl Catalog {
         self.freshness.mark_failure(now_ms);
     }
 
+    /// Records that the list of the last success showed these tools. Call it
+    /// right after [`Catalog::mark_success`].
+    pub fn mark_listed<'n>(&mut self, names: impl IntoIterator<Item = &'n str>) {
+        let listed_at = self.freshness.last_success_at;
+        for name in names {
+            if let Some(entry) = self.tools.get_mut(name) {
+                entry.listed_at = entry.listed_at.max(listed_at);
+            }
+        }
+    }
+
     /// Merges one candidate into the pins: raise, keep, or add if there is room.
     pub fn observe(&mut self, name: &str, candidate: Pin, limits: CatalogLimits) -> PinChange {
-        if let Some(pinned) = self.tools.get_mut(name) {
-            let previous = *pinned;
-            *pinned = previous.max(candidate);
+        if let Some(entry) = self.tools.get_mut(name) {
+            let previous = entry.pin;
+            entry.pin = previous.max(candidate);
             return match candidate.class.cmp(&previous.class) {
                 Ordering::Greater => PinChange::Upgraded {
                     from: previous.class,
@@ -172,7 +218,13 @@ impl Catalog {
         if BASE_LEN + self.tools_len + added > limits.max_catalog_bytes {
             return PinChange::NotPinned(CapacityLimit::MaxCatalogBytes);
         }
-        self.tools.insert(name.to_owned(), candidate);
+        self.tools.insert(
+            name.to_owned(),
+            Entry {
+                pin: candidate,
+                listed_at: None,
+            },
+        );
         self.tools_len += added;
         PinChange::New(candidate)
     }
@@ -181,9 +233,11 @@ impl Catalog {
     /// some of `other`'s tools out, if any.
     pub fn merge(&mut self, other: &Catalog, limits: CatalogLimits) -> Option<CapacityLimit> {
         let mut refused = None;
-        for (name, pin) in &other.tools {
-            if let PinChange::NotPinned(limit) = self.observe(name, *pin, limits) {
+        for (name, theirs) in &other.tools {
+            if let PinChange::NotPinned(limit) = self.observe(name, theirs.pin, limits) {
                 refused.get_or_insert(limit);
+            } else if let Some(mine) = self.tools.get_mut(name) {
+                mine.listed_at = mine.listed_at.max(theirs.listed_at);
             }
         }
         self.freshness.merge(&other.freshness);
@@ -194,10 +248,11 @@ impl Catalog {
     /// no timestamp lower (the write-verify check).
     pub fn contains(&self, other: &Catalog) -> bool {
         self.freshness.contains(&other.freshness)
-            && other
-                .tools
-                .iter()
-                .all(|(name, pin)| self.tools.get(name).is_some_and(|mine| mine >= pin))
+            && other.tools.iter().all(|(name, theirs)| {
+                self.tools.get(name).is_some_and(|mine| {
+                    mine.pin >= theirs.pin && mine.listed_at >= theirs.listed_at
+                })
+            })
     }
 
     /// Compact JSON for the shared store.
@@ -209,15 +264,16 @@ impl Catalog {
             t: self
                 .tools
                 .iter()
-                .map(|(name, pin)| (name.as_str(), pin_code(*pin)))
+                .map(|(name, entry)| (name.as_str(), (pin_code(entry.pin), entry.listed_at)))
                 .collect(),
         };
         serde_json::to_vec(&wire).unwrap_or_default()
     }
 
-    /// Reads [`Catalog::encode`] output. Anything unreadable, or another
-    /// encoding version, is `None` (treated as no shared copy). Entries with
-    /// an unknown pin code are skipped.
+    /// Reads [`Catalog::encode`] output, and the previous encoding (whose
+    /// tools were never listed, as far as this copy knows). Anything
+    /// unreadable, or another encoding version, is `None` (treated as no
+    /// shared copy). Entries with an unknown pin code are skipped.
     pub fn decode(bytes: &[u8]) -> Option<Catalog> {
         Catalog::decode_with(bytes, false)
     }
@@ -230,7 +286,7 @@ impl Catalog {
 
     fn decode_with(bytes: &[u8], complete: bool) -> Option<Catalog> {
         let wire: WireIn = serde_json::from_slice(bytes).ok()?;
-        if wire.v != ENCODING_VERSION {
+        if wire.v != ENCODING_VERSION && wire.v != PINS_ONLY_VERSION {
             return None;
         }
         let mut catalog = Catalog {
@@ -240,11 +296,17 @@ impl Catalog {
             },
             ..Catalog::default()
         };
-        for (name, code) in wire.t {
+        for (name, entry) in wire.t {
+            let (code, listed_at) = match (wire.v, entry) {
+                (PINS_ONLY_VERSION, WireEntry::Pin(code)) => (code, None),
+                (ENCODING_VERSION, WireEntry::Listed(code, listed_at)) => (code, listed_at),
+                _ if complete => return None,
+                _ => continue,
+            };
             match pin_from_code(&code) {
                 Some(pin) => {
                     catalog.tools_len += entry_len(&name);
-                    catalog.tools.insert(name, pin);
+                    catalog.tools.insert(name, Entry { pin, listed_at });
                 }
                 None if complete => return None,
                 None => {}
@@ -259,7 +321,8 @@ struct WireOut<'a> {
     v: u8,
     s: Option<u64>,
     f: Option<u64>,
-    t: BTreeMap<&'a str, &'static str>,
+    /// Pin code and listing time.
+    t: BTreeMap<&'a str, (&'static str, Option<u64>)>,
 }
 
 #[derive(Deserialize)]
@@ -267,7 +330,16 @@ struct WireIn {
     v: u8,
     s: Option<u64>,
     f: Option<u64>,
-    t: BTreeMap<String, String>,
+    t: BTreeMap<String, WireEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum WireEntry {
+    /// The previous encoding: a pin code.
+    Pin(String),
+    /// A pin code and its listing time.
+    Listed(String, Option<u64>),
 }
 
 const PIN_CODES: [(Class, Source, &str); 9] = [
@@ -412,7 +484,7 @@ struct IndexIn {
 
 fn encode_index(keys: &BTreeSet<String>) -> Vec<u8> {
     serde_json::to_vec(&IndexOut {
-        v: ENCODING_VERSION,
+        v: INDEX_VERSION,
         k: keys,
     })
     .unwrap_or_default()
@@ -420,7 +492,7 @@ fn encode_index(keys: &BTreeSet<String>) -> Vec<u8> {
 
 fn decode_index(bytes: &[u8]) -> Option<BTreeSet<String>> {
     let wire: IndexIn = serde_json::from_slice(bytes).ok()?;
-    (wire.v == ENCODING_VERSION).then_some(wire.k)
+    (wire.v == INDEX_VERSION).then_some(wire.k)
 }
 
 // --- stores -----------------------------------------------------------------------
@@ -594,6 +666,11 @@ pub struct Catalogs<S> {
     local: HashMap<String, Catalog>,
     /// Keys of local copies taken from, or saved to, the shared store.
     from_shared: HashSet<String>,
+    /// The shared copy, as stored, that was last merged into a local copy by
+    /// [`Catalogs::read`]. While the store holds these exact bytes, the local
+    /// copy already contains everything in them. Dropped whenever the local
+    /// copy changes another way.
+    merged: HashMap<String, Vec<u8>>,
     /// Returned for a catalog that does not exist.
     empty: Catalog,
 }
@@ -606,6 +683,7 @@ impl<S: Store> Catalogs<S> {
             index_key,
             local: HashMap::new(),
             from_shared: HashSet::new(),
+            merged: HashMap::new(),
             empty: Catalog::default(),
         }
     }
@@ -616,12 +694,29 @@ impl<S: Store> Catalogs<S> {
 
     /// Read path (`tools/call`): the shared copy, with this worker's copy
     /// merged into it. This worker's copy is replaced by the result, so it
-    /// only ever gains knowledge.
+    /// only ever gains knowledge. A shared copy whose bytes were already
+    /// merged is not decoded again: a large catalog would otherwise cost
+    /// every call a full decode.
     pub fn read(&mut self, key: &str) -> &Catalog {
         let limits = self.settings.limits;
-        let shared = self.load(key, Catalog::decode);
+        let fetched = self.store.get(key);
+        let unchanged = matches!(&fetched, Ok(Some((bytes, _)))
+            if self.merged.get(key).is_some_and(|merged| merged == bytes));
+        if unchanged && self.local.contains_key(key) {
+            return self.local.get(key).unwrap_or(&self.empty);
+        }
+        self.merged.remove(key);
+        let (shared, bytes) = match fetched {
+            Ok(None) => (Shared::Absent, None),
+            Ok(Some((bytes, version))) => match Catalog::decode(&bytes) {
+                Some(catalog) => (Shared::Present(catalog, version), Some(bytes)),
+                None => (Shared::Unusable, None),
+            },
+            Err(_) => (Shared::Unusable, None),
+        };
         self.note_shared(key, &shared);
-        if let Shared::Present(mut view, _) = shared {
+        if let (Shared::Present(mut view, _), Some(bytes)) = (shared, bytes) {
+            self.merged.insert(key.to_owned(), bytes);
             let local = self.local.entry(key.to_owned()).or_default();
             view.merge(local, limits);
             *local = view;
@@ -642,6 +737,7 @@ impl<S: Store> Catalogs<S> {
                 }
             }
             Shared::Absent => {
+                self.merged.remove(key);
                 if self.from_shared.remove(key) {
                     self.local.remove(key);
                 }
@@ -660,6 +756,7 @@ impl<S: Store> Catalogs<S> {
     ) -> WriteReport {
         self.write(key, now_ms, observations, |catalog| {
             catalog.mark_success(now_ms);
+            catalog.mark_listed(observations.iter().map(|(name, _)| *name));
         })
     }
 
@@ -676,6 +773,7 @@ impl<S: Store> Catalogs<S> {
     ) -> WriteReport {
         self.write(key, now_ms, observations, |catalog| {
             catalog.mark_success(now_ms);
+            catalog.mark_listed(observations.iter().map(|(name, _)| *name));
             catalog.mark_failure(now_ms);
         })
     }
@@ -775,6 +873,7 @@ impl<S: Store> Catalogs<S> {
             }
         }
         let is_stale = kept.is_stale(now_ms, settings.max_age_seconds);
+        self.merged.remove(key);
         self.local.insert(key.to_owned(), kept);
         WriteReport {
             changes,
@@ -994,8 +1093,14 @@ mod tests {
         }
         assert_eq!(refused, Some(CapacityLimit::MaxCatalogBytes));
         c.mark_success(u64::MAX);
+        let names: Vec<String> = (0..1000).map(|i| format!("tool_{i:04}")).collect();
+        c.mark_listed(names.iter().map(String::as_str));
         c.mark_failure(u64::MAX);
         let encoded = c.encode();
+        assert!(
+            String::from_utf8_lossy(&encoded).contains(&format!(",{}]", u64::MAX)),
+            "listing times are stored"
+        );
         assert!(encoded.len() <= 4096, "{} bytes", encoded.len());
         assert!(encoded.len() <= c.encoded_len_bound());
     }
@@ -1052,6 +1157,49 @@ mod tests {
     }
 
     #[test]
+    fn listing_times_merge_by_max_and_are_checked_by_contains() {
+        let mut a = catalog(&[("t", Class::Read), ("u", Class::Read)], None, None);
+        a.mark_success(10);
+        a.mark_listed(["t"]);
+        let mut b = catalog(&[("t", Class::Read)], None, None);
+        b.mark_success(20);
+        b.mark_listed(["t"]);
+        let ab = merged(&a, &b);
+        assert_eq!(ab, merged(&b, &a));
+        assert!(!ab.view("t", 20, 0).stale);
+        assert!(ab.view("u", 20, 0).stale, "never listed");
+        assert!(ab.contains(&a) && ab.contains(&b));
+        assert!(!a.contains(&b), "an earlier listing time is not contained");
+
+        // A failure on another worker after both listings untrusts t.
+        let mut failed = catalog(&[], None, None);
+        failed.freshness = ab.freshness();
+        failed.mark_failure(15);
+        let all = merged(&ab, &failed);
+        assert!(all.view("t", 30, 0).stale);
+        assert_eq!(all.pin("t").map(|p| p.class), Some(Class::Read));
+    }
+
+    #[test]
+    fn a_success_trusts_only_the_tools_its_list_showed() {
+        let mut c = catalog(&[("old", Class::Read)], None, None);
+        c.mark_success(10);
+        c.mark_listed(["old"]);
+        c.mark_failure(20);
+        c.observe("new", pin(Class::Read), BIG);
+        c.mark_success(30);
+        c.mark_listed(["new", "not_pinned"]);
+        assert!(
+            c.view("old", 30, 0).stale,
+            "old was listed before the failure"
+        );
+        assert!(!c.view("new", 30, 0).stale);
+        assert!(c.view("not_pinned", 30, 0).stale);
+        assert_eq!(c.view("not_pinned", 30, 0).pin, None);
+        assert!(!c.is_stale(30, 0), "the catalog as a whole is fresh again");
+    }
+
+    #[test]
     fn merge_reports_capacity() {
         let limits = CatalogLimits {
             max_cached_tools: 2,
@@ -1084,8 +1232,10 @@ mod tests {
             );
         }
         c.mark_success(123);
+        c.mark_listed(["t0", "t3"]);
         c.mark_failure(45);
-        assert_eq!(Catalog::decode(&c.encode()), Some(c));
+        assert_eq!(Catalog::decode(&c.encode()), Some(c.clone()));
+        assert!(c.encode().len() <= c.encoded_len_bound(), "the bound holds");
         assert_eq!(
             Catalog::decode(&Catalog::default().encode()),
             Some(Catalog::default())
@@ -1096,11 +1246,41 @@ mod tests {
     fn unreadable_or_other_versions_decode_to_nothing() {
         assert_eq!(Catalog::decode(b"garbage"), None);
         assert_eq!(
-            Catalog::decode(br#"{"v":2,"s":null,"f":null,"t":{}}"#),
+            Catalog::decode(br#"{"v":3,"s":null,"f":null,"t":{}}"#),
             None
         );
-        let skipped = Catalog::decode(br#"{"v":1,"s":1,"f":null,"t":{"ok":"ra","bad":"zz"}}"#);
+        let skipped =
+            Catalog::decode(br#"{"v":2,"s":1,"f":null,"t":{"ok":["ra",1],"bad":["zz",1]}}"#);
         assert_eq!(skipped.map(|c| c.len()), Some(1));
+        assert_eq!(
+            Catalog::decode(br#"{"v":2,"s":1,"f":null,"t":{"old":"ra"}}"#).map(|c| c.len()),
+            Some(0),
+            "an entry in the other version's shape is skipped"
+        );
+    }
+
+    #[test]
+    fn the_previous_encoding_is_read_with_no_listing_times() {
+        let Some(old) = Catalog::decode(br#"{"v":1,"s":5,"f":null,"t":{"wipe":"dd","bad":"zz"}}"#)
+        else {
+            unreachable!("the previous encoding is still read")
+        };
+        assert_eq!(
+            old.pin("wipe"),
+            Some(Pin {
+                class: Class::Destructive,
+                source: Source::Default,
+            })
+        );
+        assert_eq!(old.len(), 1);
+        assert!(
+            old.view("wipe", 10, 0).stale,
+            "kept, but not trusted until a list shows it"
+        );
+        assert!(Catalog::decode_complete(br#"{"v":1,"s":5,"f":null,"t":{"wipe":"dd"}}"#).is_some());
+        assert!(
+            Catalog::decode_complete(br#"{"v":1,"s":5,"f":null,"t":{"wipe":["dd",5]}}"#).is_none()
+        );
     }
 
     // --- keys ---------------------------------------------------------------------
@@ -1450,6 +1630,93 @@ mod tests {
         );
     }
 
+    /// Lets a worker use the store another worker is saving to.
+    struct Borrowed<'a>(&'a MemoryStore);
+
+    impl Store for Borrowed<'_> {
+        fn get(&self, key: &str) -> Result<Option<(Vec<u8>, Version)>, StoreError> {
+            self.0.get(key)
+        }
+
+        fn save(&self, key: &str, value: Vec<u8>, expected: Expect<'_>) -> Result<(), StoreError> {
+            self.0.save(key, value, expected)
+        }
+
+        fn keys(&self) -> Vec<String> {
+            self.0.keys()
+        }
+
+        fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.0.delete(key)
+        }
+    }
+
+    #[test]
+    fn a_save_prepared_before_another_workers_verified_upgrade_cannot_lower_it() {
+        let store = Rc::new(RacingStore::default());
+        let mut b = worker(Rc::clone(&store));
+        b.record_success("k", 100, &[("operate", pin(Class::Read))]);
+        // B prepares another "read" save. Right before it is stored, worker A
+        // sees "destructive", saves it, reads it back and finishes.
+        store.before_save("k", |inner| {
+            let mut a = worker(Borrowed(inner));
+            let report = a.record_success("k", 150, &[("operate", pin(Class::Destructive))]);
+            assert!(!report.retry_exhausted);
+            let mut check = worker(Borrowed(inner));
+            assert_eq!(
+                class_of(Some(check.read("k")), "operate"),
+                Some(Class::Destructive),
+                "A's upgrade is stored"
+            );
+        });
+        let report = b.record_success("k", 200, &[("operate", pin(Class::Read))]);
+        assert!(!report.retry_exhausted);
+        assert_eq!(
+            class_of(shared(&*store, "k").as_ref(), "operate"),
+            Some(Class::Destructive),
+            "B's stale save does not lower it"
+        );
+        assert_eq!(
+            class_of(Some(b.read("k")), "operate"),
+            Some(Class::Destructive)
+        );
+        let mut fresh = worker(Rc::clone(&store));
+        assert_eq!(
+            class_of(Some(fresh.read("k")), "operate"),
+            Some(Class::Destructive)
+        );
+    }
+
+    #[test]
+    fn a_partition_revisited_after_others_keeps_its_pins() {
+        let settings = CatalogSettings {
+            max_catalogs: 1,
+            ..SETTINGS
+        };
+        let store = Rc::new(MemoryStore::default());
+        let mut w = worker_with(Rc::clone(&store), settings);
+        w.record_success("a", 1, &[("operate", pin(Class::Destructive))]);
+        let refused = w.record_success("b", 2, &[("other", pin(Class::Read))]);
+        assert_eq!(refused.capacity, Some(CapacityLimit::MaxCatalogs));
+        let back = w.record_success("a", 3, &[("operate", pin(Class::Read))]);
+        assert_eq!(
+            back.changes,
+            vec![PinChange::DowngradeIgnored {
+                pinned: Class::Destructive,
+                observed: Class::Read
+            }]
+        );
+        assert_eq!(
+            class_of(Some(w.read("a")), "operate"),
+            Some(Class::Destructive)
+        );
+        let mut fresh = worker_with(Rc::clone(&store), settings);
+        assert_eq!(
+            class_of(Some(fresh.read("a")), "operate"),
+            Some(Class::Destructive)
+        );
+    }
+
     #[test]
     fn a_concurrent_failure_is_never_erased() {
         let store = Rc::new(RacingStore::default());
@@ -1645,7 +1912,7 @@ mod tests {
     #[test]
     fn an_unreadable_shared_copy_is_never_overwritten() {
         let partly = br#"{"v":1,"s":1,"f":null,"t":{"ok":"da","future":"zz"}}"#.to_vec();
-        let other_version = br#"{"v":2,"s":1,"f":null,"t":{}}"#.to_vec();
+        let other_version = br#"{"v":3,"s":1,"f":null,"t":{}}"#.to_vec();
         for stored in [partly, other_version] {
             let store = Rc::new(MemoryStore::default());
             put(&store, "k", stored.clone());
@@ -1791,6 +2058,68 @@ mod tests {
         assert!(failure.became_stale);
         assert!(w.read("k").is_stale(400, 0));
         assert_eq!(raw(&*store, "k"), None, "still not in the shared store");
+    }
+
+    #[test]
+    fn a_read_sees_every_change_to_the_shared_copy() {
+        let store = Rc::new(MemoryStore::default());
+        let mut w1 = worker(Rc::clone(&store));
+        let mut w2 = worker(Rc::clone(&store));
+        w1.record_success("k", 100, &[("x", pin(Class::Read))]);
+        assert_eq!(class_of(Some(w2.read("k")), "x"), Some(Class::Read));
+        assert_eq!(class_of(Some(w2.read("k")), "x"), Some(Class::Read));
+        assert!(!w2.read("k").view("x", 150, 0).stale);
+
+        w1.record_success("k", 200, &[("x", pin(Class::Destructive))]);
+        assert_eq!(class_of(Some(w2.read("k")), "x"), Some(Class::Destructive));
+        w1.record_failure("k", 300);
+        assert!(w2.read("k").view("x", 350, 0).stale);
+
+        // This worker's own save is read back with the shared copy.
+        w2.record_success(
+            "k",
+            400,
+            &[("x", pin(Class::Read)), ("y", pin(Class::Write))],
+        );
+        let read = w2.read("k");
+        assert_eq!(class_of(Some(read), "x"), Some(Class::Destructive));
+        assert_eq!(class_of(Some(read), "y"), Some(Class::Write));
+        assert!(!read.view("x", 450, 0).stale);
+    }
+
+    /// Reports one version for every value, as a store whose version counter
+    /// came round to the same number would.
+    struct OneVersion(Rc<MemoryStore>);
+
+    impl Store for OneVersion {
+        fn get(&self, key: &str) -> Result<Option<(Vec<u8>, Version)>, StoreError> {
+            let got = self.0.get(key)?;
+            Ok(got.map(|(bytes, _)| (bytes, Version("1".to_owned()))))
+        }
+
+        fn save(&self, key: &str, value: Vec<u8>, _: Expect<'_>) -> Result<(), StoreError> {
+            put(&self.0, key, value);
+            Ok(())
+        }
+
+        fn keys(&self) -> Vec<String> {
+            self.0.keys()
+        }
+
+        fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.0.delete(key)
+        }
+    }
+
+    #[test]
+    fn a_read_compares_the_shared_copy_itself_not_its_version() {
+        let store = Rc::new(MemoryStore::default());
+        let mut w1 = worker(OneVersion(Rc::clone(&store)));
+        let mut w2 = worker(OneVersion(Rc::clone(&store)));
+        w1.record_success("k", 100, &[("x", pin(Class::Read))]);
+        assert_eq!(class_of(Some(w2.read("k")), "x"), Some(Class::Read));
+        w1.record_success("k", 200, &[("x", pin(Class::Destructive))]);
+        assert_eq!(class_of(Some(w2.read("k")), "x"), Some(Class::Destructive));
     }
 
     #[test]

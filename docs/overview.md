@@ -21,10 +21,10 @@ MCP Tool Annotation Guard is a **Security** policy for MCP server instances on M
 - **Fail-safe defaults.** Unannotated tools are destructive; tools the gateway hasn't seen in a list are refused (`unknown_tool`); configuration errors fail closed.
 - **New tools handled automatically.** A tool the vendor adds is classified the first time it is listed, with no configuration change.
 - **Rug-pull protection (pinning).** A tool's class can be raised but never silently lowered while the gateway runs. If a server later claims a destructive tool is read-only, the guard keeps it destructive and logs a warning.
-- **Stale-catalog protection.** If the guard can't inspect a tool list (compressed, too large, invalid, or cut off by the gateway), it stops trusting what it learned before until it can inspect one again.
+- **Stale-catalog protection.** If the guard can't inspect a tool list (compressed, too large, invalid, or cut off by the gateway), it stops trusting what it learned before. Each tool is trusted again once a list the guard can inspect shows it.
 - **Audit mode.** Logs what it would have refused, without refusing or filtering anything, so you can roll out safely.
 - **Clear refusals.** Stable reason codes for code (`level_insufficient`, `tool_blocked`, `unknown_tool`, …) and readable messages for models, so agents can self-correct. The defaults (JSON-RPC code `-32008`, HTTP 200) match Omni Gateway's native MCP access-control denial.
-- **Low overhead.** Tool call *responses* are never buffered, parsed or changed. In our benchmark the guard added under 0.2 ms at p99 to `tools/call`.
+- **Low overhead.** Tool call *responses* are never buffered, parsed or changed. In our benchmark the guard added 0.2 to 0.3 ms at p99 to `tools/call`, and under 0.5 ms with 5,000 tools.
 
 ## Design-time companion: the MCP Server Safety ruleset
 

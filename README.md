@@ -77,6 +77,8 @@ Some integration tests are opt-in because they need extra setup or measure timin
 | `cache_placement` | Placement with the P4A MCP Response Cache (needs `MCP_RESPONSE_CACHE_DIR`, see the file header) |
 | `log_forwarding` | Guard events reach the gateway's log forwarding outputs |
 | `sse_server_request_first` | An SSE list whose server first sends a request to the client stalls (needs Node; see the file header) |
+| `interrupted_lists` | A list the gateway cuts off (upstream reset, timeout) or the client hangs up on makes the guard stop trusting the catalog, and a later page trusts only its own tools again (needs Docker Desktop; see the file header) |
+| `passthrough` | Requests forwarded without a body check carry nothing unchecked: no WebSocket upgrade, no HTTP/2 body (needs Docker Desktop and curl; see the file header) |
 
 ### Publishing
 

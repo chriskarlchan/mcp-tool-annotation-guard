@@ -219,7 +219,8 @@ async fn log_forwarding() -> anyhow::Result<()> {
     assert_eq!(denied["reason"], "level_insufficient");
     assert!(
         denied["apiInstance"].is_string(),
-        "event without apiInstance: {denied}"
+        "event without apiInstance: {}",
+        denied
     );
     assert!(otlp_hits > 0, "no OTLP post carried the call_denied event");
     Ok(())

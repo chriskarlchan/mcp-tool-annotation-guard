@@ -4,7 +4,10 @@
 //!
 //! Times are milliseconds from the PDK clock. A catalog is stale when its last
 //! failure is later than its last success, or when `catalog.maxAgeSeconds` is
-//! set and the last success is older than that.
+//! set and the last success is older than that. A pin is used for decisions
+//! only while its own tool is fresh: the tool was shown by an inspected list
+//! after the last failure, and within `catalog.maxAgeSeconds`
+//! ([`Freshness::trusts`]).
 
 /// Why a catalog was marked stale (logged as `catalog_stale.reason`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,6 +62,22 @@ impl Freshness {
             };
         }
         false
+    }
+
+    /// `true` when a tool may be decided with its pin. `listed_at` is the
+    /// last success whose list showed the tool: no failure may be recorded
+    /// since, and with `catalog.maxAgeSeconds` set it must be no older than
+    /// that. A success for another list (a later page, say) does not count,
+    /// so a tool is trusted again only once a list the guard inspects shows it.
+    pub fn trusts(&self, listed_at: Option<u64>, now_ms: u64, max_age_seconds: u64) -> bool {
+        let Some(listed) = listed_at else {
+            return false;
+        };
+        if self.last_failure_at >= Some(listed) {
+            return false;
+        }
+        max_age_seconds == 0
+            || now_ms.saturating_sub(listed) <= max_age_seconds.saturating_mul(1000)
     }
 
     /// Takes the later of each timestamp (merge).
@@ -134,6 +153,31 @@ mod tests {
         assert!(f.is_stale(25, 0));
         f.mark_success(30);
         assert!(!f.is_stale(35, 0));
+    }
+
+    #[test]
+    fn a_tool_is_trusted_only_if_listed_after_the_last_failure() {
+        let f = at(Some(30), Some(20));
+        assert!(f.trusts(Some(30), 40, 0));
+        assert!(!f.trusts(Some(10), 40, 0), "listed before the failure");
+        assert!(!f.trusts(Some(20), 40, 0), "a tie is not 'after'");
+        assert!(!f.trusts(None, 40, 0), "never listed");
+        assert!(at(Some(30), None).trusts(Some(10), 40, 0));
+    }
+
+    #[test]
+    fn max_age_counts_from_the_list_that_showed_the_tool() {
+        let f = at(Some(61_000), None);
+        assert!(f.trusts(Some(1_000), 61_000, 60));
+        assert!(
+            !f.trusts(Some(1_000), 61_001, 60),
+            "a later list without the tool does not renew it"
+        );
+        assert!(f.trusts(Some(61_000), 61_001, 60));
+        assert!(
+            f.trusts(Some(1_000), u64::MAX, 0),
+            "maxAge 0 disables expiry"
+        );
     }
 
     #[test]

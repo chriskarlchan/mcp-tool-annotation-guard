@@ -32,6 +32,8 @@ reqwest = "0.11"
 # Test-time JWT encoding for tests/identity_providers.rs (tokens are signed with the openssl CLI).
 base64 = "0.22"
 tokio = { version = "1", features = ["time"] }
+# The format local Data Storage writes values in, to check the stored layout.
+pdk-serde-fixint = "1.11.0"
 
 [lib]
 crate-type = ["cdylib"]

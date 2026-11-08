@@ -284,13 +284,15 @@ fn process<S: Store>(
     };
 
     let max_age_seconds = catalogs.settings().max_age_seconds;
-    let stale = catalog.is_none_or(|catalog| catalog.is_stale(*now_ms, max_age_seconds));
     let caller = &pending.caller;
     let visible = |name: &str| {
-        let view = CatalogView {
-            pin: catalog.and_then(|catalog: &Catalog| catalog.pin(name)),
-            stale,
-        };
+        let view = catalog.map_or(
+            CatalogView {
+                pin: None,
+                stale: true,
+            },
+            |catalog: &Catalog| catalog.view(name, *now_ms, max_age_seconds),
+        );
         decide::list_entry_visible(name, config, caller, view)
     };
     filtered(total, Some(key), log, visible, rewrite)
@@ -505,6 +507,12 @@ mod tests {
 
         fn pin(&mut self, key: &str, tool: &str) -> Option<Class> {
             self.catalogs.read(key).pin(tool).map(|pin| pin.class)
+        }
+
+        /// The tool's pin may be used for decisions.
+        fn trusted(&mut self, key: &str, tool: &str, now_ms: u64) -> bool {
+            let max_age = self.catalogs.settings().max_age_seconds;
+            !self.catalogs.read(key).view(tool, now_ms, max_age).stale
         }
     }
 
@@ -895,6 +903,109 @@ mod tests {
         );
         assert!(!w.stale("k", 100));
         assert!(w.events.is_empty(), "{:?}", w.events);
+    }
+
+    #[test]
+    fn a_later_page_trusts_only_the_tools_it_shows() {
+        let mut w = World::new(json!({}));
+        let pending = w.pending(&[], Ok("k"));
+        let page1 = list(json!([read("wipe")]), json!({"nextCursor": "p2"}));
+        w.respond(JSON, &page1, &pending, 100);
+        assert!(w.trusted("k", "wipe", 100));
+
+        // The server raises wipe to destructive, but the guard can't inspect
+        // the list that says so.
+        let raised = list(json!([destructive("wipe")]), json!({"nextCursor": "p2"}));
+        w.respond_with(200, Some("gzip"), JSON, &raised, &pending, 200);
+        assert!(!w.trusted("k", "wipe", 200));
+
+        // Listing only page 2 does not make wipe's old read pin trusted.
+        let page2 = list(json!([read("other")]), json!({}));
+        assert_eq!(
+            w.respond(JSON, &page2, &pending, 300),
+            Outcome::ForwardNoStore
+        );
+        assert!(w.trusted("k", "other", 300));
+        assert!(!w.trusted("k", "wipe", 300), "not shown since the failure");
+        assert_eq!(w.pin("k", "wipe"), Some(Class::Read), "kept, not trusted");
+
+        // A list that shows wipe raises it and trusts it again.
+        let out = rewritten(w.respond(JSON, &raised, &pending, 400));
+        assert!(names(&out).is_empty(), "hidden from a read caller");
+        assert!(w.trusted("k", "wipe", 400));
+        assert_eq!(w.pin("k", "wipe"), Some(Class::Destructive));
+    }
+
+    #[test]
+    fn under_classify_by_name_a_stale_catalog_never_lowers_a_class() {
+        let mut w = World::new(json!({
+            "onUnknownTool": "classifyByName",
+            "nameRules": [{"pattern": "^get_", "class": "read"}]
+        }));
+        let pending = w.pending(&[], Ok("k"));
+        let page1 = list(
+            json!([destructive("get_records")]),
+            json!({"nextCursor": "p2"}),
+        );
+        w.respond(JSON, &page1, &pending, 100);
+        w.respond_with(200, Some("gzip"), JSON, &page1, &pending, 200);
+        let page2 = list(json!([read("get_other")]), json!({}));
+        w.respond(JSON, &page2, &pending, 300);
+
+        let max_age = w.catalogs.settings().max_age_seconds;
+        let view = w.catalogs.read("k").view("get_records", 300, max_age);
+        assert!(view.stale);
+        assert_eq!(
+            decide::effective_class("get_records", &w.config, view),
+            decide::Effective::Known {
+                class: Class::Destructive,
+                basis: decide::Basis::Pin(crate::classify::Source::Annotations),
+            },
+            "the name rule says read, but the pin is destructive"
+        );
+        assert!(!decide::list_entry_visible(
+            "get_records",
+            &w.config,
+            &pending.caller,
+            view
+        ));
+    }
+
+    #[test]
+    fn a_later_page_does_not_hide_tools_of_an_earlier_page_from_view() {
+        // Page 2's list is filtered with page 2's tools only, so an earlier
+        // page's tools never decide what page 2 shows.
+        let mut w = World::new(json!({}));
+        let pending = w.pending(&[], Ok("k"));
+        w.respond(
+            JSON,
+            &list(json!([read("a")]), json!({"nextCursor": "p2"})),
+            &pending,
+            100,
+        );
+        let page2 = list(json!([read("b"), destructive("c")]), json!({}));
+        let out = rewritten(w.respond(JSON, &page2, &pending, 200));
+        assert_eq!(names(&out), vec!["b"]);
+        assert!(
+            w.trusted("k", "a", 200),
+            "no failure since page 1 showed it"
+        );
+    }
+
+    #[test]
+    fn max_age_counts_from_the_list_that_showed_each_tool() {
+        let mut w = World::new(json!({"catalog": {"maxAgeSeconds": 60}}));
+        let pending = w.pending(&[], Ok("k"));
+        w.respond(
+            JSON,
+            &list(json!([read("a")]), json!({"nextCursor": "p2"})),
+            &pending,
+            1_000,
+        );
+        w.respond(JSON, &list(json!([read("b")]), json!({})), &pending, 50_000);
+        assert!(w.trusted("k", "a", 61_000));
+        assert!(!w.trusted("k", "a", 61_001), "page 2 does not renew page 1");
+        assert!(w.trusted("k", "b", 61_001));
     }
 
     // --- no filtering in audit mode or with filterToolsList: false --------------------

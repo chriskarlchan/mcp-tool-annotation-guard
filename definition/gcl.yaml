@@ -124,7 +124,8 @@ spec:
       type: string
       title: Class for tools without annotations
       description: >-
-        Used for tools that declare no annotations and match no name rule.
+        Used for tools that have no annotations object and match no name
+        rule. A tool whose annotations declare neither hint is destructive.
         With destructive (safest), only callers with the destructive level can
         use them.
       enum:
@@ -136,7 +137,7 @@ spec:
       type: array
       title: Name rules for tools without annotations
       description: >-
-        Classify tools that declare no annotations by name, for example ^get_
+        Classify tools that have no annotations object by name, for example ^get_
         as read. Tried in order; the first matching regular expression wins.
         Never overrides real annotations.
       items:
@@ -206,7 +207,8 @@ spec:
       description: >-
         Only for servers that show different tools to different tenants or
         users. An expression for the value that separates them, for example a
-        tenant ID. If set but empty for a request, calls are refused.
+        tenant ID from a verified token. If set but empty for a request, calls
+        are refused.
       bindings:
         attributes: true
         authentication: true
@@ -267,14 +269,15 @@ spec:
     catalog:
       type: object
       title: "Advanced: tool catalog expiry"
-      description: How long the guard trusts the tool list it last saw.
+      description: How long the guard trusts what a tool list showed it.
       properties:
         maxAgeSeconds:
           type: integer
           title: Maximum catalog age (seconds)
           description: >-
-            After this time, calls are refused until the agent lists tools
-            again. Most clients list once per session, so leave at 0 (off).
+            After this time since a list last showed a tool, calls to it are
+            refused until the agent lists tools again. Most clients list once
+            per session, so leave at 0 (off).
           default: 0
     limits:
       type: object

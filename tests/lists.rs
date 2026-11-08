@@ -4,10 +4,13 @@
 //! local Omni Gateway. They cover what the pdk-unit tests cannot: the real
 //! gateway's handling of a replaced body (`Content-Length`), the
 //! `Accept-Encoding` rewrite reaching the upstream and encoded responses,
-//! buffered SSE, a list the gateway will not take back once changed, and
+//! buffered SSE (events whose data spans several lines, and a leading
+//! byte-order mark), a list the gateway will not take back once changed, and
 //! the catalog learned on the response leg governing a later request.
 
 mod common;
+#[path = "common/sse.rs"]
+mod sse;
 
 use httpmock::{Method::POST, MockServer};
 use pdk_test::port::Port;
@@ -17,6 +20,7 @@ use pdk_test::{pdk_test, TestComposite};
 use serde_json::{json, Value};
 
 use common::*;
+use sse::sse_events;
 
 const PORT: Port = 8081;
 
@@ -35,6 +39,15 @@ fn list_body() -> String {
     json!({"jsonrpc": "2.0", "id": 1, "result": {"tools": [
         {"name": "search", "annotations": {"readOnlyHint": true}},
         {"name": "drop", "annotations": {"destructiveHint": true}}
+    ]}})
+    .to_string()
+}
+
+/// `search` plus a destructive `tool`.
+fn sse_list_with(tool: &str) -> String {
+    json!({"jsonrpc": "2.0", "id": 1, "result": {"tools": [
+        {"name": "search", "annotations": {"readOnlyHint": true}},
+        {"name": tool, "annotations": {"destructiveHint": true}}
     ]}})
     .to_string()
 }
@@ -70,14 +83,19 @@ impl Reply {
         String::from_utf8_lossy(&self.body).into_owned()
     }
 
-    /// Tool names of a JSON list, or of the first `data:` line of an SSE list.
+    /// Tool names of a JSON list, or of the first SSE event, decoded as a
+    /// client does (one leading BOM removed, `data:` lines joined).
     fn tool_names(&self) -> Vec<String> {
         let text = self.text();
-        let json = text
-            .lines()
-            .find_map(|line| line.strip_prefix("data: "))
-            .unwrap_or(&text);
-        let value: Value = serde_json::from_str(json).unwrap_or(Value::Null);
+        let sse = self
+            .header("content-type")
+            .is_some_and(|t| t.starts_with("text/event-stream"));
+        let json = if sse {
+            sse_events(&text).into_iter().next().unwrap_or_default()
+        } else {
+            text
+        };
+        let value: Value = serde_json::from_str(&json).unwrap_or(Value::Null);
         value
             .pointer("/result/tools")
             .and_then(Value::as_array)
@@ -190,6 +208,41 @@ async fn list_processing() -> anyhow::Result<()> {
                 .body(format!("event: message\nid: 1\ndata: {}\n\n", list_body()));
         })
         .await;
+    // An event whose data spans several lines, and streams that start with
+    // a byte-order mark, each listing a destructive tool of its own.
+    let sse_variants = [
+        ("sse-multi", "purge", "event: message\ndata: {\"jsonrpc\":\"2.0\",\ndata: \"id\":1,\"result\":{\"tools\":[{\"name\":\"search\",\"annotations\":{\"readOnlyHint\":true}},\ndata: {\"name\":\"purge\",\"annotations\":{\"destructiveHint\":true}}]}}\n\n".to_owned()),
+        ("sse-bom-data", "wipe", format!("\u{feff}data: {}\n\n", sse_list_with("wipe"))),
+        ("sse-bom-event", "erase", format!("\u{feff}event: message\ndata: {}\n\n", sse_list_with("erase"))),
+    ];
+    let mut sse_variant_mocks = Vec::new();
+    let mut hidden_calls = Vec::new();
+    for (reply, tool, body) in &sse_variants {
+        let (reply, body) = (reply.to_string(), body.clone());
+        sse_variant_mocks.push(
+            server
+                .mock_async(|when, then| {
+                    when.method(POST)
+                        .header("x-test-reply", reply.as_str())
+                        .body_contains("tools/list");
+                    then.status(200)
+                        .header("content-type", "text/event-stream")
+                        .body(body);
+                })
+                .await,
+        );
+        let needle = format!("\"name\":\"{tool}\"");
+        hidden_calls.push(
+            server
+                .mock_async(|when, then| {
+                    when.method(POST).body_contains(needle.as_str());
+                    then.status(200)
+                        .header("content-type", "application/json")
+                        .body(r#"{"jsonrpc":"2.0","id":2,"result":{"content":[]}}"#);
+                })
+                .await,
+        );
+    }
     // An upstream that compresses anyway.
     let gzip_list = server
         .mock_async(|when, then| {
@@ -199,7 +252,7 @@ async fn list_processing() -> anyhow::Result<()> {
             then.status(200)
                 .header("content-type", "application/json")
                 .header("content-encoding", "gzip")
-                .body(GZIP_LIST.to_vec());
+                .body(GZIP_LIST);
         })
         .await;
     // Larger than the gateway's default buffer limit (1 MiB).
@@ -292,6 +345,30 @@ async fn list_processing() -> anyhow::Result<()> {
     );
     sse_list.assert_hits_async(1).await;
 
+    // Each variant is inspected, not forwarded: a client decoding the stream
+    // sees valid JSON without the destructive tool, and the guard learned it.
+    for (i, ((reply_name, tool, _), mock)) in
+        sse_variants.iter().zip(&sse_variant_mocks).enumerate()
+    {
+        let reply = post(&client, &url, list(), reply_name).await?;
+        assert_eq!(reply.status, 200);
+        assert_eq!(
+            reply.tool_names(),
+            vec!["search"],
+            "{reply_name}: {}",
+            reply.text()
+        );
+        mock.assert_hits_async(1).await;
+        let reply = post(&client, &url, call(10 + i as u64, tool), "none").await?;
+        let body: Value = serde_json::from_slice(&reply.body).unwrap_or(Value::Null);
+        assert_eq!(
+            body.pointer("/error/data/reason"),
+            Some(&json!("level_insufficient")),
+            "{reply_name}"
+        );
+        hidden_calls[i].assert_hits_async(0).await;
+    }
+
     // A list with nothing hidden is still meant for this caller only: a
     // shared cache scope becomes private, and the validators are removed.
     let reply = post(&client, &url, list(), "scope").await?;
@@ -341,9 +418,22 @@ async fn list_processing() -> anyhow::Result<()> {
     assert_eq!(reply.header("etag"), None);
     near_limit.assert_hits_async(1).await;
 
-    // The list itself was inspected, so the catalog is fresh again and
-    // keeps what it learned: `drop` is known and destructive.
+    // The list itself was inspected, but it did not show `drop`, so `drop`
+    // stays unknown.
     let reply = post(&client, &url, call(4, "drop"), "none").await?;
+    let body: Value = serde_json::from_slice(&reply.body).unwrap_or(Value::Null);
+    assert_eq!(
+        body.pointer("/error/data/reason"),
+        Some(&json!("unknown_tool"))
+    );
+    drop_call.assert_hits_async(0).await;
+
+    // Once a list shows `drop` again, the guard decides with what it
+    // learned: `drop` is known and destructive.
+    let reply = post(&client, &url, list(), "json").await?;
+    assert_eq!(reply.tool_names(), vec!["search"]);
+    json_list.assert_hits_async(2).await;
+    let reply = post(&client, &url, call(5, "drop"), "none").await?;
     let body: Value = serde_json::from_slice(&reply.body).unwrap_or(Value::Null);
     assert_eq!(
         body.pointer("/error/data/reason"),

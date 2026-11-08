@@ -110,7 +110,7 @@ onUnknownTool: classifyByName
 |---|---|
 | Everyone | `get_issues` |
 
-Every other tool stays destructive. Anchor patterns with `^`: `_get_` would also match `post_get_status`. Check the server's real `tools/list` first; names edited in the Bridge wizard may not follow the pattern. On a Bridge instance, place the guard directly after MCP Support (see **Configuration**).
+Every other tool stays destructive. Anchor patterns with `^`: `_get_` would also match `post_get_status`. Check the server's real `tools/list` first; names edited in the Bridge wizard may not follow the pattern. On a Bridge instance, place the guard directly after MCP Support (see the **Deployment & Ordering** tab).
 
 ## E. Roll out in audit mode, with OAuth scopes
 
@@ -151,7 +151,7 @@ grants:
   - { attribute: mcp.admin, level: destructive }
 ```
 
-If tenant A's `operate` tool is read-only but tenant B's is destructive, a tenant B reader can't call it because of what tenant A's list said. A request with no `tid` claim gets an empty list and its calls are refused `partition_unavailable`.
+If tenant A's `operate` tool is read-only but tenant B's is destructive, a tenant B reader can't call it because of what tenant A's list said. A request with no `tid` claim gets an empty list and its calls are refused `partition_unavailable`. Read the partition from a verified claim like this, never from a header a client sets.
 
 ## H. Correct a server's annotations, and refuse with tool results
 

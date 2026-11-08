@@ -4,10 +4,11 @@
 //! guard ≤ 1 ms. One local gateway serves two otherwise identical APIs, one
 //! with the guard and one without; requests alternate between them so drift
 //! affects both equally. 100 warm-up and 1000 measured sequential calls per
-//! API, 10 KB request bodies, warm catalog.
+//! API, 10 KB request bodies, warm catalog: one tool, and the most tools a
+//! catalog keeps by default (`limits.maxCachedTools`).
 //!
 //! Opt-in (timing-sensitive, not part of `make test`):
-//! `make build && cargo test --test latency -- --ignored --nocapture`
+//! `make build && cargo test --test latency -- --ignored --nocapture --test-threads 1`
 
 mod common;
 
@@ -27,6 +28,8 @@ const BARE: Port = 8082;
 const WARMUP: usize = 100;
 const MEASURED: usize = 1000;
 const BUDGET: Duration = Duration::from_millis(1);
+/// The default `limits.maxCachedTools`.
+const MAX_CACHED_TOOLS: usize = 5000;
 
 fn percentile(sorted: &[Duration], p: f64) -> Duration {
     let rank = ((p / 100.0) * sorted.len() as f64).ceil() as usize;
@@ -69,9 +72,34 @@ async fn timed(client: &reqwest::Client, url: &str, body: &str) -> anyhow::Resul
     Ok(elapsed)
 }
 
+/// `count` tools: `fetch` (read) first, then a mix of read, write and
+/// destructive tools with realistic name lengths.
+fn tools(count: usize) -> Vec<serde_json::Value> {
+    let mut tools = vec![json!({"name": "fetch", "annotations": {"readOnlyHint": true}})];
+    for i in 1..count {
+        let name = format!("customer_records_{i:04}_update_account_entry");
+        tools.push(match i % 3 {
+            0 => json!({"name": name, "annotations": {"readOnlyHint": true}}),
+            1 => json!({"name": name, "annotations": {"readOnlyHint": false, "destructiveHint": false}}),
+            _ => json!({"name": name}),
+        });
+    }
+    tools
+}
+
 #[pdk_test]
 #[ignore = "timing benchmark; run explicitly"]
 async fn latency_gate() -> anyhow::Result<()> {
+    measure(1).await
+}
+
+#[pdk_test]
+#[ignore = "timing benchmark; run explicitly"]
+async fn latency_gate_large_catalog() -> anyhow::Result<()> {
+    measure(MAX_CACHED_TOOLS).await
+}
+
+async fn measure(count: usize) -> anyhow::Result<()> {
     let httpmock_config = HttpMockConfig::builder()
         .port(80)
         .version("latest")
@@ -117,17 +145,18 @@ async fn latency_gate() -> anyhow::Result<()> {
     let httpmock: HttpMock = composite.service()?;
     let server = MockServer::connect_async(httpmock.socket()).await;
 
+    let listed = tools(count);
+    let readable = listed
+        .iter()
+        .filter(|tool| tool["annotations"]["readOnlyHint"] == true)
+        .count();
+    let list_body = json!({"jsonrpc": "2.0", "id": 1, "result": {"tools": listed}}).to_string();
     server
         .mock_async(|when, then| {
             when.method(POST).body_contains("tools/list");
             then.status(200)
                 .header("content-type", "application/json")
-                .body(
-                    json!({"jsonrpc": "2.0", "id": 1, "result": {"tools": [
-                        {"name": "fetch", "annotations": {"readOnlyHint": true}}
-                    ]}})
-                    .to_string(),
-                );
+                .body(list_body.as_str());
         })
         .await;
     server
@@ -140,13 +169,25 @@ async fn latency_gate() -> anyhow::Result<()> {
         .await;
 
     let client = reqwest::Client::new();
-    // Warm catalog: the guard learns `fetch` from a list.
-    timed(
-        &client,
-        &guarded_url,
-        &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string(),
-    )
-    .await?;
+    // Warm catalog: the guard learns every tool from a list, and filters it
+    // to the read tools the default level allows.
+    let reply = client
+        .post(&guarded_url)
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string())
+        .send()
+        .await?
+        .bytes()
+        .await?;
+    let reply: serde_json::Value = serde_json::from_slice(&reply)?;
+    let shown = reply["result"]["tools"].as_array().map_or(0, Vec::len);
+    assert_eq!(
+        shown,
+        readable,
+        "list of {count} tools ({} B) was not filtered: {reply}",
+        list_body.len()
+    );
 
     // Precondition: the guard is on the guarded API only (an unlisted tool is
     // refused there and forwarded on the bare API).
@@ -186,7 +227,11 @@ async fn latency_gate() -> anyhow::Result<()> {
         }
     }
 
-    println!("{MEASURED} sequential tools/call, {} B body", call.len());
+    println!(
+        "{MEASURED} sequential tools/call, {} B body, catalog of {count} tools ({} B list)",
+        call.len(),
+        list_body.len()
+    );
     let p99_guard = summary("guard", &mut with_guard);
     let p99_bare = summary("no guard", &mut without);
     let added = p99_guard.saturating_sub(p99_bare);

@@ -33,7 +33,7 @@ use serde::de::{Deserialize, Deserializer, IgnoredAny, MapAccess, Visitor};
 use serde_json::value::RawValue;
 
 use crate::config::Config;
-use crate::envelope::{check_strict_json, parse_message, Kind, StrictError};
+use crate::envelope::{check_strict_json, fold_key, parse_message, Kind, StrictError};
 use crate::filter::{inspect, Inspection, ListResult, Rewritten, BOM};
 use crate::freshness::StaleReason;
 use crate::ids::{self, Id};
@@ -248,7 +248,8 @@ fn looks_like_json(data: &str) -> bool {
 const MISREAD_BOM: &str = "\u{ef}\u{bb}\u{bf}";
 
 /// The top-level `id` of a JSON object, and whether any top-level key
-/// repeats (after decoding escapes).
+/// repeats (after decoding escapes). Keys are compared as some clients
+/// compare them, so `"ID"` is an `id` and repeats one.
 struct TopLevel<'a> {
     duplicate: bool,
     id: Option<&'a RawValue>,
@@ -276,6 +277,7 @@ impl<'de> Visitor<'de> for TopLevelVisitor {
             id: None,
         };
         while let Some(key) = map.next_key::<String>()? {
+            let key = fold_key(&key);
             if key == "id" {
                 top.id = Some(map.next_value()?);
             } else {
@@ -557,6 +559,11 @@ mod tests {
             list("1", r#","_meta":{"n":1e400}"#),
             list("1", r#","_meta":{"s":"\ud83d"}"#),
             list("1", &deep),
+            // Keys some clients read as `id`, or as the same member.
+            list("1", "").replace(r#""id":1"#, r#""ID":1"#),
+            list("1", "").replace(r#""id":1"#, r#""id":2,"Id":1"#),
+            list("1", r#","Tools":[{"name":"b"}]"#),
+            list("1", "").replace(r#""name":"b""#, r#""name":"b","Name":"a""#),
         ];
         let error = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"x"}}"#;
         for first in &doubtful {
