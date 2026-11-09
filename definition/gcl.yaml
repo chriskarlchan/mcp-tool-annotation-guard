@@ -81,6 +81,7 @@ spec:
           level:
             type: string
             title: Access level
+            description: Level the caller gets at least.
             enum:
               - read
               - write
@@ -109,9 +110,11 @@ spec:
           name:
             type: string
             title: Tool name
+            description: Must be unique and must not also be a blocked tool.
           class:
             type: string
             title: Class
+            description: Class to enforce for this tool.
             enum:
               - read
               - write
@@ -150,6 +153,7 @@ spec:
           class:
             type: string
             title: Class
+            description: Class for a tool whose name matches.
             enum:
               - read
               - write
@@ -304,10 +308,12 @@ spec:
         maxToolNameBytes:
           type: integer
           title: Maximum tool name (bytes)
+          description: Calls with a longer tool name are refused.
           default: 256
         maxBatchSize:
           type: integer
           title: Maximum JSON-RPC batch size
+          description: Larger JSON-RPC batches are refused.
           default: 32
         maxCachedTools:
           type: integer

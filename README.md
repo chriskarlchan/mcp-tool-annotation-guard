@@ -63,6 +63,7 @@ make build                          # compile the Wasm policy
 make test                           # pdk-unit tests + integration tests (Docker)
 node mock-mcp-server/server.mjs     # mock MCP server on :8080 (switches: top of server.mjs)
 make run                            # policy in a local gateway (playground/config/api.yaml)
+make clean                          # remove build output
 ```
 
 `make test` and `make run` generate a local, disconnected `registration.yaml` on first use; it is git-ignored. If Docker can't be found, set `DOCKER_HOST` to your Docker socket (on Docker Desktop for macOS: `unix://$HOME/.docker/run/docker.sock`).

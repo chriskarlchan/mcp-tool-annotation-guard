@@ -60,6 +60,11 @@ build: build-asset-files ## Build the policy definition and implementation
 	@cargo anypoint gcl-gen -d $(DEFINITION_NAME) -n $(DEFINITION_NAMESPACE) -w $(TARGET_DIR)/$(CRATE_NAME).wasm -o $(TARGET_DIR)/$(CRATE_NAME)_implementation.yaml
 	@echo $(POLICY_REF_NAME) > target/policy-ref-name.txt
 
+.PHONY: clean
+clean: ## Remove build output
+	cargo clean
+	cargo clean --manifest-path guard-core/Cargo.toml
+
 .PHONY: run
 run: build playground/config/registration.yaml ## Run the policy in local flex
 	@anypoint-cli-v4 pdk log -t "warn" -m "Remember to update the config values in playground/config/api.yaml file for the policy configuration"

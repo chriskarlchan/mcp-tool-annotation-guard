@@ -4,6 +4,18 @@ All notable changes to this policy are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.0.2] - 2026-11-09
+
+### Added
+
+- `make clean` removes the build output.
+
+### Changed
+
+- Every setting in the API Manager form now has a description, including the
+  fields inside grants, tool class overrides and name rules, and the tool name
+  and batch size limits.
+
 ## [1.0.1] - 2026-11-08
 
 ### Fixed
@@ -175,5 +187,6 @@ First release.
 See [docs/overview.md](docs/overview.md) for limitations and
 [docs/configuration.md](docs/configuration.md) for every property.
 
+[1.0.2]: https://github.com/chriskarlchan/mcp-tool-annotation-guard/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/chriskarlchan/mcp-tool-annotation-guard/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/chriskarlchan/mcp-tool-annotation-guard/releases/tag/v1.0.0
