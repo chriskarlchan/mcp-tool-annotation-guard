@@ -47,8 +47,10 @@ pub struct EnvelopeLimits {
 pub enum RequestDetail {
     Envelope,
     IdType,
+    IdRange,
     DuplicateKeys,
     AmbiguousKeys,
+    AmbiguousMethod,
     DuplicateIds,
     EmptyBatch,
     UnsupportedBatch,
@@ -60,8 +62,10 @@ impl RequestDetail {
         match self {
             RequestDetail::Envelope => "envelope",
             RequestDetail::IdType => "id_type",
+            RequestDetail::IdRange => "id_range",
             RequestDetail::DuplicateKeys => "duplicate_keys",
             RequestDetail::AmbiguousKeys => "ambiguous_keys",
+            RequestDetail::AmbiguousMethod => "ambiguous_method",
             RequestDetail::DuplicateIds => "duplicate_ids",
             RequestDetail::EmptyBatch => "empty_batch",
             RequestDetail::UnsupportedBatch => "unsupported_batch",
@@ -75,6 +79,7 @@ impl RequestDetail {
 pub enum ParamsDetail {
     MissingToolName,
     NameTooLong,
+    NameCharacters,
     ParamsType,
 }
 
@@ -83,6 +88,7 @@ impl ParamsDetail {
         match self {
             ParamsDetail::MissingToolName => "missing_tool_name",
             ParamsDetail::NameTooLong => "name_too_long",
+            ParamsDetail::NameCharacters => "name_characters",
             ParamsDetail::ParamsType => "params_type",
         }
     }
@@ -95,6 +101,8 @@ pub enum EnvelopeError {
     Parse,
     /// `invalid_request`, with its detail.
     InvalidRequest(RequestDetail),
+    /// `invalid_request` (`id_range`) for a single request, with its id.
+    IdRange { id: Id },
     /// `invalid_params` for a single `tools/call` request, with its id.
     InvalidParams { id: Id, detail: ParamsDetail },
 }
@@ -321,7 +329,7 @@ fn inspect_batch(
     let mut routes = Vec::with_capacity(elements.len());
     for element in elements {
         let message = parse_message(element).map_err(EnvelopeError::InvalidRequest)?;
-        routes.push(route(&message, limits)?);
+        routes.push(route(&message, limits).map_err(for_batch)?);
     }
 
     let mut seen = HashSet::new();
@@ -362,6 +370,14 @@ fn inspect_batch(
     Ok(Routing::PassThrough)
 }
 
+/// A batch is refused as a whole, so its refusal names no request.
+fn for_batch(err: EnvelopeError) -> EnvelopeError {
+    match err {
+        EnvelopeError::IdRange { .. } => EnvelopeError::InvalidRequest(RequestDetail::IdRange),
+        other => other,
+    }
+}
+
 /// How one valid message is routed.
 enum Route {
     /// A `tools/list` request.
@@ -373,7 +389,20 @@ enum Route {
 }
 
 fn route(message: &Message<'_>, limits: EnvelopeLimits) -> Result<Route, EnvelopeError> {
+    // A server that reads numbers as doubles reads several such IDs as the
+    // same one and answers with that one, so the guard could not tell which
+    // response answers which request.
+    if let Kind::Request { id } = &message.kind {
+        if !id.is_double_safe() {
+            return Err(EnvelopeError::IdRange { id: id.clone() });
+        }
+    }
     let method = message.method.as_deref();
+    if method.is_some_and(is_method_variant) {
+        return Err(EnvelopeError::InvalidRequest(
+            RequestDetail::AmbiguousMethod,
+        ));
+    }
     match (&message.kind, method) {
         (Kind::Request { id }, Some(TOOLS_LIST)) => Ok(Route::List(id.clone())),
         (Kind::Request { id }, Some(TOOLS_CALL)) => Ok(Route::Request(RequestElement {
@@ -405,24 +434,97 @@ fn check_call_params(
     if has_folded_duplicates(members.keys()) {
         return Err(EnvelopeError::InvalidRequest(RequestDetail::DuplicateKeys));
     }
+    if has_control_key(members.keys()) {
+        return Err(EnvelopeError::InvalidRequest(RequestDetail::AmbiguousKeys));
+    }
     let Some(name) = members.get("name").and_then(|raw| decode_string(raw)) else {
         return Ok(CallCheck::InvalidParams(ParamsDetail::MissingToolName));
     };
     if name.len() > limits.max_tool_name_bytes {
         return Ok(CallCheck::InvalidParams(ParamsDetail::NameTooLong));
     }
+    if has_hidden_characters(&name) {
+        return Ok(CallCheck::InvalidParams(ParamsDetail::NameCharacters));
+    }
     Ok(CallCheck::Call { name })
+}
+
+/// `true` if a server may read `method` as `tools/call` or `tools/list`
+/// although it is neither. Readers built on C strings end a string at its
+/// first NUL, and some servers ignore case or trim whitespace, so a method
+/// with a control character, or one of the two in other case or with
+/// whitespace or invisible characters, could run a call the guard never
+/// checked. No MCP method has a control character.
+fn is_method_variant(method: &str) -> bool {
+    if method == TOOLS_CALL || method == TOOLS_LIST {
+        return false;
+    }
+    if method.chars().any(char::is_control) {
+        return true;
+    }
+    let visible: String = method
+        .chars()
+        .filter(|&c| !c.is_whitespace() && !is_format(c))
+        .collect();
+    let folded = fold_key(&visible);
+    folded == TOOLS_CALL || folded == TOOLS_LIST
+}
+
+/// `true` if a tool name has a character a server, client or log may drop,
+/// cut the name at, or show as nothing: a control character (a NUL ends a C
+/// string), an invisible formatting character (such as a zero-width space or
+/// a byte-order mark), or a line or paragraph separator. MCP tool names
+/// should use only ASCII letters, digits, `_`, `-` and `.`.
+pub(crate) fn has_hidden_characters(name: &str) -> bool {
+    name.chars()
+        .any(|c| c.is_control() || is_format(c) || c == '\u{2028}' || c == '\u{2029}')
+}
+
+/// `true` for a Unicode format character (general category Cf).
+fn is_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{ad}'
+            | '\u{600}'..='\u{605}'
+            | '\u{61c}'
+            | '\u{6dd}'
+            | '\u{70f}'
+            | '\u{890}'..='\u{891}'
+            | '\u{8e2}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206f}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{110bd}'
+            | '\u{110cd}'
+            | '\u{13430}'..='\u{1343f}'
+            | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0001}'
+            | '\u{e0020}'..='\u{e007f}'
+    )
 }
 
 /// `true` if two keys may name the same member for some server. Go's
 /// `encoding/json` matches member names regardless of case (with `ſ` as `s`,
-/// `ı` and `İ` as `i`, and `K` as `k`), and some JSON libraries ignore a NUL
-/// in a name, so a server may read `"Name"` or `"name\u0000"` as `name`. Keys
-/// are compared with NULs removed and case folded, which covers both.
+/// `ı` and `İ` as `i`, and `K` as `k`), and JSON readers built on C strings
+/// end a name at its first NUL, so a server may read `"Name"` or
+/// `"name\u0000"` as `name`. Keys are compared with NULs removed and case
+/// folded; [`has_control_key`] covers a NUL anywhere else.
 pub(crate) fn has_folded_duplicates<'k>(keys: impl Iterator<Item = &'k String>) -> bool {
     let mut seen = HashSet::new();
     keys.map(|key| fold_key(key))
         .any(|folded| !seen.insert(folded))
+}
+
+/// `true` if a key has a control character. A reader built on C strings
+/// reads `"method\u0000x"` as `method`, and no member the guard reads has
+/// one.
+pub(crate) fn has_control_key<'k>(mut keys: impl Iterator<Item = &'k String>) -> bool {
+    keys.any(|key| key.chars().any(char::is_control))
 }
 
 /// A key with NULs removed and case folded (see [`has_folded_duplicates`]).
@@ -460,7 +562,7 @@ pub fn parse_message(raw: &RawValue) -> Result<Message<'_>, RequestDetail> {
     // `{"id":1,"result":{},"Method":"tools/call",...}` is a response to the
     // guard, but a request to a server that reads `Method` as `method` and
     // takes any message with a method for a request.
-    if has_member_variant(members.keys()) {
+    if has_control_key(members.keys()) || has_member_variant(members.keys()) {
         return Err(RequestDetail::AmbiguousKeys);
     }
 
@@ -1032,12 +1134,63 @@ mod tests {
     }
 
     #[test]
-    fn big_integer_ids_are_echoed_exactly() {
-        let big = "123456789012345678901234567890";
-        let Ok(Routing::Decide { requests, .. }) = inspect(&call_body(big, "echo")) else {
-            unreachable!("expected a decision");
-        };
-        assert_eq!(requests.first().map(|r| r.id.raw()), Some(big));
+    fn integer_ids_a_double_cannot_hold_are_refused() {
+        // A server that reads numbers as doubles answers 2^53 + 1 with 2^53.
+        for raw in [
+            "9007199254740992",
+            "9007199254740993",
+            "-9007199254740993",
+            "123456789012345678901234567890",
+        ] {
+            let ping = format!(r#"{{"jsonrpc":"2.0","id":{raw},"method":"ping"}}"#);
+            for body in [list_body(raw), call_body(raw, "echo"), ping] {
+                assert_eq!(
+                    inspect(&body),
+                    Err(EnvelopeError::IdRange { id: id(raw) }),
+                    "{body}"
+                );
+            }
+        }
+        let lists = format!(
+            "[{},{}]",
+            list_body("9007199254740992"),
+            list_body("9007199254740993")
+        );
+        let calls = format!(
+            "[{},{}]",
+            call_body("1", "echo"),
+            call_body("9007199254740993", "echo")
+        );
+        for body in [lists, calls] {
+            assert_eq!(
+                inspect_v(&body, BATCH_PROTOCOL_VERSION),
+                invalid(RequestDetail::IdRange),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn ids_a_double_holds_and_long_numeric_strings_are_kept() {
+        for raw in [
+            "9007199254740991",
+            "-9007199254740991",
+            r#""9007199254740993""#,
+        ] {
+            assert_eq!(
+                inspect(&list_body(raw)),
+                Ok(Routing::ExpectList(vec![id(raw)]))
+            );
+            let Ok(Routing::Decide { requests, .. }) = inspect(&call_body(raw, "echo")) else {
+                unreachable!("expected a decision for {raw}");
+            };
+            assert_eq!(requests.first().map(|r| r.id.raw()), Some(raw));
+        }
+        // The client is answering an ID the server chose.
+        assert_eq!(
+            inspect(r#"{"jsonrpc":"2.0","id":9007199254740993,"result":{}}"#),
+            Ok(Routing::PassThrough)
+        );
     }
 
     // --- routing of single messages -----------------------------------------
@@ -1083,19 +1236,172 @@ mod tests {
     }
 
     #[test]
-    fn method_names_are_compared_exactly() {
+    fn methods_a_server_may_read_as_a_tool_method_are_refused() {
         for method in [
             "Tools/Call",
+            "TOOLS/LIST",
+            "tools/List",
             "tools/call ",
             " tools/call",
+            "tools/list\n",
+            "\ttools/list",
+            "tools/\u{a0}call",
+            "\u{feff}tools/call",
+            "tools/\u{200b}list",
+            "tools/call\u{2028}",
+            "toolſ/call",
             "tools/call\u{0}",
+            "tools/call\u{0}x",
+            "tools/list\u{0}tools/call",
+            // A control character anywhere: no MCP method has one.
+            "resources/read\u{0}",
+            "ping\u{7f}",
+            "tools/call\u{85}",
+        ] {
+            let request =
+                serde_json::json!({"jsonrpc":"2.0","id":1,"method":method,"params":{"name":"x"}});
+            assert_eq!(
+                inspect(&request.to_string()),
+                invalid(RequestDetail::AmbiguousMethod),
+                "{method:?}"
+            );
+            let notification =
+                serde_json::json!({"jsonrpc":"2.0","method":method,"params":{"name":"x"}});
+            assert_eq!(
+                inspect(&notification.to_string()),
+                invalid(RequestDetail::AmbiguousMethod),
+                "{method:?}"
+            );
+            let batch = format!(r#"[{},{}]"#, call_body("2", "echo"), request);
+            assert_eq!(
+                inspect(&batch),
+                invalid(RequestDetail::AmbiguousMethod),
+                "{method:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_methods_pass_unchanged() {
+        for method in [
             "tools//call",
+            "tools.call",
+            "tools/calls",
+            "tools/list/",
+            "tool/call",
+            "resources/read",
+            "Resources/Read",
+            "prompts/get ",
         ] {
             let body =
                 serde_json::json!({"jsonrpc":"2.0","id":1,"method":method,"params":{"name":"x"}})
                     .to_string();
             assert_eq!(inspect(&body), Ok(Routing::PassThrough), "{method:?}");
         }
+    }
+
+    #[test]
+    fn keys_with_a_control_character_are_refused() {
+        let refused = [
+            // A reader that ends a key at a NUL reads `method\u0000x` as `method`.
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","method\u0000x":"tools/call","params":{"name":"x"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method\u0000x":"tools/call","params":{"name":"x"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"id\u0000x":2,"method":"ping"}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping","x\u0001":1}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","name\u0000x":"delete_repo"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","name\u001f":"delete_repo"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name\u0000x":"delete_repo"}}"#,
+        ];
+        for body in refused {
+            assert_eq!(
+                inspect(body),
+                invalid(RequestDetail::AmbiguousKeys),
+                "{body}"
+            );
+        }
+        // A NUL at the end of a repeated key is still a duplicate.
+        assert_eq!(
+            inspect(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","name\u0000":"delete_repo"}}"#
+            ),
+            invalid(RequestDetail::DuplicateKeys)
+        );
+        // Keys inside `arguments` are the tool's own data.
+        assert_eq!(
+            inspect(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","arguments":{"a\u0000b":1}}}"#
+            ),
+            Ok(Routing::Decide {
+                batch: false,
+                requests: vec![call("1", "echo")],
+            })
+        );
+    }
+
+    #[test]
+    fn tool_names_with_hidden_characters_are_refused() {
+        let err = |raw: &str| {
+            let body = format!(
+                r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"{raw}"}}}}"#
+            );
+            inspect(&body)
+        };
+        for raw in [
+            r"delete\u0000_list",
+            r"delete\n_list",
+            r"a\tb",
+            r"echo\r",
+            r"a\u001bb",
+            r"a\u007fb",
+            r"a\u0085b",
+            r"a\u009fb",
+            r"a\u200bb",
+            r"\ufeffecho",
+            r"a\u202eb",
+            r"a\u2066b",
+            r"a\u00adb",
+            r"a\u2028b",
+            r"a\u2029b",
+            r"a\udb40\udc41b",
+        ] {
+            assert_eq!(
+                err(raw),
+                Err(EnvelopeError::InvalidParams {
+                    id: id("3"),
+                    detail: ParamsDetail::NameCharacters,
+                }),
+                "{raw}"
+            );
+        }
+        // Other characters are a server's choice.
+        for name in ["a b", "échö", "名前", "a/b:c", "a\u{a0}b"] {
+            assert_eq!(
+                inspect(&call_body("1", name)),
+                Ok(Routing::Decide {
+                    batch: false,
+                    requests: vec![call("1", name)],
+                }),
+                "{name:?}"
+            );
+        }
+        // In a batch the element gets its own `invalid_params` entry.
+        let batch = format!(
+            r#"[{},{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"a\u0000"}}}}]"#,
+            call_body("2", "echo")
+        );
+        assert_eq!(
+            inspect(&batch),
+            Ok(Routing::Decide {
+                batch: true,
+                requests: vec![
+                    call("2", "echo"),
+                    RequestElement {
+                        id: id("3"),
+                        call: CallCheck::InvalidParams(ParamsDetail::NameCharacters),
+                    },
+                ],
+            })
+        );
     }
 
     #[test]

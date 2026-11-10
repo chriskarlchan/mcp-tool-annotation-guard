@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 [package]
 name = "mcp_tool_annotation_guard"
-version = "1.0.2"
+version = "1.0.3"
 rust-version = "1.88.0"
 edition = "2018"
 resolver = "2"

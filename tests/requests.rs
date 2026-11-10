@@ -197,6 +197,22 @@ async fn request_phase_enforcement() -> anyhow::Result<()> {
     assert_eq!(body["error"]["data"]["detail"], json!("duplicate_keys"));
     search.assert_hits_async(1).await;
 
+    // A server that reads numbers as doubles, as JavaScript does, answers
+    // 2^53 + 1 with 2^53, so a request with such an ID is refused.
+    let big_id = 9_007_199_254_740_993_u64;
+    for big in [
+        call(big_id, "search"),
+        json!({"jsonrpc": "2.0", "id": big_id, "method": "tools/list"}).to_string(),
+    ] {
+        let (status, _, body) = post(&client, &guarded_url, big.clone(), &[]).await?;
+        assert_eq!(status, 400, "{}", big);
+        assert_eq!(body["id"], json!(big_id), "{}", big);
+        assert_eq!(body["error"]["code"], json!(-32600));
+        assert_eq!(reason(&body), &json!("invalid_request"));
+        assert_eq!(body["error"]["data"]["detail"], json!("id_range"));
+    }
+    search.assert_hits_async(1).await;
+
     // Without a "method" key this is a response to the guard, but a request
     // to a server that reads "Method" as method and takes any message with a
     // method for a request (as Go SDKs do).
@@ -210,6 +226,37 @@ async fn request_phase_enforcement() -> anyhow::Result<()> {
         assert_eq!(body["error"]["data"]["detail"], json!("ambiguous_keys"));
     }
     blocked.assert_hits_async(0).await;
+
+    // A server may read these methods as tools/call: some ignore case or
+    // trim, and readers built on C strings end a string at its first NUL.
+    for method in ["Tools/Call", "tools/call ", "tools/call\u{0}x"] {
+        let smuggled = json!({"jsonrpc": "2.0", "id": 15, "method": method, "params": {"name": "delete_repository"}});
+        let (status, _, body) = post(&client, &guarded_url, smuggled.to_string(), &[]).await?;
+        assert_eq!(status, 400, "{method:?}");
+        assert_eq!(reason(&body), &json!("invalid_request"));
+        assert_eq!(body["error"]["data"]["detail"], json!("ambiguous_method"));
+    }
+    // Such a reader also reads "name\u0000x" as name.
+    let nul_key = r#"{"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"search","name\u0000x":"delete_repository"}}"#;
+    let (status, _, body) = post(&client, &guarded_url, nul_key.to_owned(), &[]).await?;
+    assert_eq!(status, 400);
+    assert_eq!(body["error"]["data"]["detail"], json!("ambiguous_keys"));
+    blocked.assert_hits_async(0).await;
+    search.assert_hits_async(1).await;
+
+    // A tool name with a control or invisible character is refused.
+    for name in [
+        "delete_repository\u{0}",
+        "delete_repository\n",
+        "delete\u{200b}_repository",
+    ] {
+        let (status, _, body) = post(&client, &guarded_url, call(17, name), &[]).await?;
+        assert_eq!(status, 200, "{name:?}");
+        assert_eq!(body["id"], json!(17));
+        assert_eq!(body["error"]["code"], json!(-32602));
+        assert_eq!(reason(&body), &json!("invalid_params"));
+        assert_eq!(body["error"]["data"]["detail"], json!("name_characters"));
+    }
 
     // Express's express.json() decodes a body with the charset its client
     // names. In UTF-7, "+AG4-ame" is "name", so the server would run the
@@ -253,11 +300,17 @@ async fn request_phase_enforcement() -> anyhow::Result<()> {
             &blocked,
             2,
         ),
+        (call(big_id, "search"), &search, 3),
+        (
+            json!({"jsonrpc": "2.0", "id": 15, "method": "Tools/Call", "params": {"name": "delete_repository"}}).to_string(),
+            &blocked,
+            3,
+        ),
         // Not valid JSON.
         (
             r#"{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"search""#.to_owned(),
             &search,
-            3,
+            4,
         ),
     ];
     for (body, mock, hits) in forwarded {
@@ -274,7 +327,7 @@ async fn request_phase_enforcement() -> anyhow::Result<()> {
         .send()
         .await?;
     assert_eq!(response.status().as_u16(), 200);
-    search.assert_hits_async(4).await;
+    search.assert_hits_async(5).await;
 
     Ok(())
 }

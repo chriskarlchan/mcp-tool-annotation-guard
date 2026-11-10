@@ -299,6 +299,26 @@ async fn list_processing() -> anyhow::Result<()> {
                 .body(near_limit_list(1024 * 1024 - 4));
         })
         .await;
+    // Read-only tools whose names have characters a server or client may
+    // drop or cut the name at.
+    let hidden_names = server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .header("x-test-reply", "hidden-names")
+                .body_contains("tools/list");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(
+                    json!({"jsonrpc": "2.0", "id": 1, "result": {"tools": [
+                        {"name": "search", "annotations": {"readOnlyHint": true}},
+                        {"name": "drop\u{0}", "annotations": {"readOnlyHint": true}},
+                        {"name": "drop\n", "annotations": {"readOnlyHint": true}},
+                        {"name": "dr\u{200b}op", "annotations": {"readOnlyHint": true}}
+                    ]}})
+                    .to_string(),
+                );
+        })
+        .await;
     let drop_call = server
         .mock_async(|when, then| {
             when.method(POST).body_contains("\"name\":\"drop\"");
@@ -333,6 +353,39 @@ async fn list_processing() -> anyhow::Result<()> {
         Some(&json!("level_insufficient"))
     );
     drop_call.assert_hits_async(0).await;
+
+    // A server that reads numbers as doubles would answer this ID with a
+    // rounded one, so the list is refused before it reaches the server, and
+    // what the guard learned stays trusted.
+    let huge_id_list =
+        json!({"jsonrpc": "2.0", "id": 9_007_199_254_740_993_u64, "method": "tools/list"});
+    let reply = post(&client, &url, huge_id_list, "json").await?;
+    assert_eq!(reply.status, 400);
+    let body: Value = serde_json::from_slice(&reply.body).unwrap_or(Value::Null);
+    assert_eq!(body.pointer("/error/data/detail"), Some(&json!("id_range")));
+    json_list.assert_hits_async(1).await;
+    let reply = post(&client, &url, call(2, "drop"), "none").await?;
+    let body: Value = serde_json::from_slice(&reply.body).unwrap_or(Value::Null);
+    assert_eq!(
+        body.pointer("/error/data/reason"),
+        Some(&json!("level_insufficient"))
+    );
+    drop_call.assert_hits_async(0).await;
+
+    // A server that ignores case or trims may read these as `tools/list`
+    // and answer with the whole list, so they are refused as well.
+    for method in ["tools/list ", "Tools/List", "tools/list\u{0}"] {
+        let variant = json!({"jsonrpc": "2.0", "id": 1, "method": method});
+        let reply = post(&client, &url, variant, "json").await?;
+        assert_eq!(reply.status, 400, "{method:?}");
+        let body: Value = serde_json::from_slice(&reply.body).unwrap_or(Value::Null);
+        assert_eq!(
+            body.pointer("/error/data/detail"),
+            Some(&json!("ambiguous_method")),
+            "{method:?}"
+        );
+    }
+    json_list.assert_hits_async(1).await;
 
     // SSE, buffered whole.
     let reply = post(&client, &url, list(), "sse").await?;
@@ -453,6 +506,21 @@ async fn list_processing() -> anyhow::Result<()> {
     );
     assert!(reply.tool_names().is_empty());
     big_list.assert_hits_async(1).await;
+
+    // Entries whose names have hidden characters are removed, though they
+    // say they are read-only, and calls to such names are refused.
+    let reply = post(&client, &url, list(), "hidden-names").await?;
+    assert_eq!(reply.status, 200);
+    assert_eq!(reply.tool_names(), vec!["search"]);
+    hidden_names.assert_hits_async(1).await;
+    let reply = post(&client, &url, call(3, "drop\u{0}"), "none").await?;
+    assert_eq!(reply.status, 200);
+    let body: Value = serde_json::from_slice(&reply.body).unwrap_or(Value::Null);
+    assert_eq!(body.pointer("/error/code"), Some(&json!(-32602)), "{body}");
+    assert_eq!(
+        body.pointer("/error/data/detail"),
+        Some(&json!("name_characters"))
+    );
 
     Ok(())
 }

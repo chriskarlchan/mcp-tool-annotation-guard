@@ -249,7 +249,8 @@ const MISREAD_BOM: &str = "\u{ef}\u{bb}\u{bf}";
 
 /// The top-level `id` of a JSON object, and whether any top-level key
 /// repeats (after decoding escapes). Keys are compared as some clients
-/// compare them, so `"ID"` is an `id` and repeats one.
+/// compare them, so `"ID"` is an `id` and repeats one, and a key with a
+/// control character (which a client may cut at a NUL) counts as a repeat.
 struct TopLevel<'a> {
     duplicate: bool,
     id: Option<&'a RawValue>,
@@ -277,6 +278,9 @@ impl<'de> Visitor<'de> for TopLevelVisitor {
             id: None,
         };
         while let Some(key) = map.next_key::<String>()? {
+            if key.chars().any(char::is_control) {
+                top.duplicate = true;
+            }
             let key = fold_key(&key);
             if key == "id" {
                 top.id = Some(map.next_value()?);
@@ -564,6 +568,9 @@ mod tests {
             list("1", "").replace(r#""id":1"#, r#""id":2,"Id":1"#),
             list("1", r#","Tools":[{"name":"b"}]"#),
             list("1", "").replace(r#""name":"b""#, r#""name":"b","Name":"a""#),
+            // A key a client that ends keys at a NUL reads as `id`.
+            list("1", "").replace(r#""id":1"#, r#""id\u0000x":1"#),
+            list("2", "").replace(r#""id":2"#, r#""id":2,"id\u0000":1"#),
         ];
         let error = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"x"}}"#;
         for first in &doubtful {

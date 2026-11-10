@@ -3,8 +3,10 @@
 //! Request IDs kept as raw JSON tokens and compared by type and exact token.
 //!
 //! An [`Id`] keeps the token exactly as the client sent it, so it can be echoed
-//! byte for byte (integers beyond 64 bits survive). Comparison is by type
-//! first, so `7` never equals `"7"`.
+//! byte for byte (integers beyond 64 bits survive, although a request with an
+//! integer beyond JavaScript's safe range is refused; see
+//! [`Id::is_double_safe`]). Comparison is by type first, so `7` never equals
+//! `"7"`.
 //!
 //! Two spellings are treated as the same ID because every JSON parser reads
 //! them as the same value: a string with escapes (`"\u0061"`) equals its
@@ -18,6 +20,10 @@
 //! does not filter.
 
 use std::hash::{Hash, Hasher};
+
+/// The largest integer that no other integer reads as the same double
+/// (JavaScript's `Number.MAX_SAFE_INTEGER`).
+const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
 
 /// A valid JSON-RPC request ID: a JSON string or an integer.
 #[derive(Clone, Debug)]
@@ -74,6 +80,22 @@ impl Id {
     /// The token exactly as received, for echoing in replies.
     pub fn raw(&self) -> &str {
         &self.raw
+    }
+
+    /// Whether a server that reads JSON numbers as doubles, as JavaScript does,
+    /// can tell this ID from every other one: `true` for strings and for
+    /// integers within ±[`MAX_SAFE_INTEGER`] (JavaScript's
+    /// `Number.isSafeInteger`). Beyond that, several integers read as the same
+    /// double, and the server answers with that double.
+    pub fn is_double_safe(&self) -> bool {
+        match &self.key {
+            Key::Str(_) => true,
+            Key::Int(digits) => digits
+                .strip_prefix('-')
+                .unwrap_or(digits)
+                .parse::<u64>()
+                .is_ok_and(|n| n <= MAX_SAFE_INTEGER),
+        }
     }
 
     /// The finite number a JavaScript client converts this ID to with
@@ -226,6 +248,34 @@ mod tests {
         assert_ne!(valid(big), valid("123456789012345678901234567891"));
         let negative = "-98765432109876543210987654321";
         assert_eq!(valid(negative).raw(), negative);
+    }
+
+    #[test]
+    fn only_strings_and_safe_integers_are_double_safe() {
+        for raw in [
+            "0",
+            "-0",
+            "7",
+            "-7",
+            "9007199254740991",
+            "-9007199254740991",
+            r#""9007199254740993""#,
+            r#""123456789012345678901234567890""#,
+        ] {
+            assert!(valid(raw).is_double_safe(), "{raw}");
+        }
+        for raw in [
+            "9007199254740992",
+            "9007199254740993",
+            "-9007199254740992",
+            "-9007199254740993",
+            "18446744073709551615",
+            "18446744073709551616",
+            "123456789012345678901234567890",
+            "-98765432109876543210987654321",
+        ] {
+            assert!(!valid(raw).is_double_safe(), "{raw}");
+        }
     }
 
     #[test]

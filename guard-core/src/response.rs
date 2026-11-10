@@ -44,11 +44,20 @@ pub struct Reply {
 pub enum ProtocolError {
     Parse,
     InvalidRequest(RequestDetail),
-    InvalidParams { id: Id, detail: ParamsDetail },
+    /// `invalid_request` (`id_range`), answered with the request's id.
+    IdRange {
+        id: Id,
+    },
+    InvalidParams {
+        id: Id,
+        detail: ParamsDetail,
+    },
     TooLarge,
     Encoded,
     MethodNotAllowed,
-    Internal { id: Option<Id> },
+    Internal {
+        id: Option<Id>,
+    },
 }
 
 impl From<EnvelopeError> for ProtocolError {
@@ -56,6 +65,7 @@ impl From<EnvelopeError> for ProtocolError {
         match err {
             EnvelopeError::Parse => ProtocolError::Parse,
             EnvelopeError::InvalidRequest(detail) => ProtocolError::InvalidRequest(detail),
+            EnvelopeError::IdRange { id } => ProtocolError::IdRange { id },
             EnvelopeError::InvalidParams { id, detail } => {
                 ProtocolError::InvalidParams { id, detail }
             }
@@ -77,7 +87,7 @@ impl ProtocolError {
     pub fn reason(&self) -> &'static str {
         match self {
             ProtocolError::Parse => "parse_error",
-            ProtocolError::InvalidRequest(_) => "invalid_request",
+            ProtocolError::InvalidRequest(_) | ProtocolError::IdRange { .. } => "invalid_request",
             ProtocolError::InvalidParams { .. } => "invalid_params",
             ProtocolError::TooLarge => "too_large",
             ProtocolError::Encoded => "encoded",
@@ -89,6 +99,7 @@ impl ProtocolError {
     pub fn detail(&self) -> Option<&'static str> {
         match self {
             ProtocolError::InvalidRequest(detail) => Some(detail.as_str()),
+            ProtocolError::IdRange { .. } => Some(RequestDetail::IdRange.as_str()),
             ProtocolError::InvalidParams { detail, .. } => Some(detail.as_str()),
             _ => None,
         }
@@ -105,7 +116,9 @@ impl ProtocolError {
 
     fn status(&self) -> u16 {
         match self {
-            ProtocolError::Parse | ProtocolError::InvalidRequest(_) => 400,
+            ProtocolError::Parse
+            | ProtocolError::InvalidRequest(_)
+            | ProtocolError::IdRange { .. } => 400,
             ProtocolError::InvalidParams { .. } => 200,
             ProtocolError::TooLarge => 413,
             ProtocolError::Encoded => 415,
@@ -116,7 +129,7 @@ impl ProtocolError {
 
     fn id(&self) -> Option<&Id> {
         match self {
-            ProtocolError::InvalidParams { id, .. } => Some(id),
+            ProtocolError::InvalidParams { id, .. } | ProtocolError::IdRange { id } => Some(id),
             ProtocolError::Internal { id } => id.as_ref(),
             _ => None,
         }
@@ -538,6 +551,15 @@ mod tests {
                 200,
                 json!(7),
                 Some("name_too_long"),
+            ),
+            (
+                ProtocolError::IdRange {
+                    id: id("9007199254740993"),
+                },
+                -32600,
+                400,
+                json!(9_007_199_254_740_993_u64),
+                Some("id_range"),
             ),
             (ProtocolError::TooLarge, -32600, 413, json!(null), None),
             (ProtocolError::Encoded, -32600, 415, json!(null), None),

@@ -31,8 +31,8 @@ use crate::catalog::Pin;
 use crate::classify::{classify_tool, Classified, Outcome};
 use crate::config::{Class, Config};
 use crate::envelope::{
-    check_strict_json, has_folded_duplicates, is_identity_encoding, is_utf8_label, parse_message,
-    Kind, StrictError,
+    check_strict_json, has_control_key, has_folded_duplicates, has_hidden_characters,
+    is_identity_encoding, is_utf8_label, parse_message, Kind, StrictError,
 };
 use crate::freshness::StaleReason;
 use crate::ids::{self, Id};
@@ -268,7 +268,7 @@ fn inspect_result(source: &str, result: &RawValue, config: &Config) -> Result<Ta
     }
     let members: BTreeMap<String, &RawValue> =
         serde_json::from_str(result.get()).map_err(|_| invalid)?;
-    if has_folded_duplicates(members.keys()) {
+    if has_unclear_keys(&members) {
         return Err(invalid);
     }
     let tools = members.get("tools").ok_or(invalid)?;
@@ -302,8 +302,8 @@ fn inspect_result(source: &str, result: &RawValue, config: &Config) -> Result<Ta
 
 /// Validates and classifies one entry; `None` if invalid. An entry or
 /// `annotations` object with keys a client may read as the same member
-/// (`"name"` and `"Name"`) makes the whole response invalid, like an exact
-/// duplicate does.
+/// (`"name"` and `"Name"`) or as another one (a key with a NUL) makes the
+/// whole response invalid, like an exact duplicate does.
 fn entry_tool(item: &RawValue, config: &Config) -> Result<Option<Tool>, StaleReason> {
     if item.get().as_bytes().first() != Some(&b'{') {
         return Ok(None);
@@ -312,9 +312,7 @@ fn entry_tool(item: &RawValue, config: &Config) -> Result<Option<Tool>, StaleRea
         return Ok(None);
     };
     let annotations = members.get("annotations");
-    if has_folded_duplicates(members.keys())
-        || annotations.is_some_and(|raw| object_has_folded_duplicates(raw))
-    {
+    if has_unclear_keys(&members) || annotations.is_some_and(|raw| object_has_unclear_keys(raw)) {
         return Err(StaleReason::ResponseInvalid);
     }
     let Some(Ok(name)) = members
@@ -323,7 +321,7 @@ fn entry_tool(item: &RawValue, config: &Config) -> Result<Option<Tool>, StaleRea
     else {
         return Ok(None);
     };
-    if name.len() > config.limits.max_tool_name_bytes {
+    if name.len() > config.limits.max_tool_name_bytes || has_hidden_characters(&name) {
         return Ok(None);
     }
     let annotations: Option<Value> = match annotations {
@@ -337,11 +335,16 @@ fn entry_tool(item: &RawValue, config: &Config) -> Result<Option<Tool>, StaleRea
     Ok(Some(Tool { name, classified }))
 }
 
-/// `true` if `raw` is an object with keys a client may read as the same member.
-fn object_has_folded_duplicates(raw: &RawValue) -> bool {
+/// `true` if a client may read two keys as the same member, or a key as another one.
+fn has_unclear_keys(members: &BTreeMap<String, &RawValue>) -> bool {
+    has_folded_duplicates(members.keys()) || has_control_key(members.keys())
+}
+
+/// [`has_unclear_keys`] for `raw`, if it is an object.
+fn object_has_unclear_keys(raw: &RawValue) -> bool {
     raw.get().as_bytes().first() == Some(&b'{')
         && serde_json::from_str::<BTreeMap<String, &RawValue>>(raw.get())
-            .is_ok_and(|members| has_folded_duplicates(members.keys()))
+            .is_ok_and(|members| has_unclear_keys(&members))
 }
 
 impl ListResult {
@@ -643,6 +646,29 @@ mod tests {
     }
 
     #[test]
+    fn entries_whose_name_has_hidden_characters_are_invalid() {
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[
+            {"name":"delete_all\u0000_list","annotations":{"readOnlyHint":true}},
+            {"name":"delete_all\n_list","annotations":{"readOnlyHint":true}},
+            {"name":"a\u200bb","annotations":{"readOnlyHint":true}},
+            {"name":"\ufeffecho","annotations":{"readOnlyHint":true}},
+            {"name":"a\u2028b","annotations":{"readOnlyHint":true}},
+            {"name":"a b","annotations":{"readOnlyHint":true}},
+            {"name":"échö","annotations":{"readOnlyHint":true}}]}}"#;
+        let result = lists(body, &["1"], &config(json!({})));
+        assert_eq!(result.invalid_entries(), 5);
+        assert_eq!(
+            result.tools().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            ["a b", "échö"]
+        );
+        let Rewritten {
+            body: out, removed, ..
+        } = result.rewrite(|_| true);
+        assert_eq!(removed, 5);
+        assert!(!out.contains("delete_all"), "{out}");
+    }
+
+    #[test]
     fn blocked_and_overridden_tools_are_listed_but_not_pinned() {
         let c = config(
             json!({"blockedTools": ["drop"], "toolOverrides": [{"name": "edit", "class": "read"}]}),
@@ -741,6 +767,11 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"a","name\u0000":"b"}]}}"#,
             r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"a","annotations":{"readOnlyHint":true},"Annotations":{}}]}}"#,
             r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"a","annotations":{"readOnlyHint":true,"ReadOnlyHint":false}}]}}"#,
+            // Keys a client that ends keys at a NUL reads as another member.
+            r#"{"jsonrpc":"2.0","id":1,"id\u0000x":2,"result":{"tools":[]}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[],"tools\u0000x":[]}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"a","name\u0000x":"b"}]}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"a","annotations":{"readOnlyHint":true,"readOnlyHint\u0001":false}}]}}"#,
         ] {
             assert_eq!(
                 outcome(body, &["1"]),

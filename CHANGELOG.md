@@ -4,6 +4,37 @@ All notable changes to this policy are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.0.3] - 2026-11-10
+
+### Fixed
+
+- A request whose `id` was an integer outside JavaScript's safe range could
+  make a `tools/list` answer pass unfiltered, and make the guard stop trusting
+  what it had learned. A server that reads JSON numbers as doubles, such as
+  one written in JavaScript, can answer such an `id` with a rounded one, so
+  the guard couldn't tell which answer was the list. Requests with an integer
+  `id` beyond ±9007199254740991 are now refused `invalid_request`
+  (`id_range`) and not forwarded. String IDs and smaller integers are not
+  affected.
+- A request whose method a server could read as `tools/call` or
+  `tools/list` passed unchecked: a method in other letter case or with
+  whitespace or invisible characters (`Tools/Call`, `tools/call` followed by
+  a space), or with a control character. Some servers ignore case or trim
+  the method, and JSON readers built on C strings end a string at its first
+  NUL. Such requests are now refused `invalid_request` (`ambiguous_method`)
+  and not forwarded.
+- A key with a NUL followed by more text could name another member for a
+  server whose JSON reader ends keys at the first NUL, such as a second
+  `name` in a `tools/call`. Keys with a control character in a request or
+  its `params` are now refused `invalid_request` (`ambiguous_keys`), and a
+  list response with such keys is treated like one with duplicate keys.
+- Tool names with a control character, an invisible formatting character
+  (such as a zero-width space or a byte-order mark) or a line or paragraph
+  separator are now refused in calls (`invalid_params`, detail
+  `name_characters`), and list entries with such names are removed and
+  never learned. A server could cut such a name short or drop the character
+  and run a tool the guard didn't decide on.
+
 ## [1.0.2] - 2026-11-09
 
 ### Added
@@ -187,6 +218,7 @@ First release.
 See [docs/overview.md](docs/overview.md) for limitations and
 [docs/configuration.md](docs/configuration.md) for every property.
 
+[1.0.3]: https://github.com/chriskarlchan/mcp-tool-annotation-guard/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/chriskarlchan/mcp-tool-annotation-guard/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/chriskarlchan/mcp-tool-annotation-guard/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/chriskarlchan/mcp-tool-annotation-guard/releases/tag/v1.0.0

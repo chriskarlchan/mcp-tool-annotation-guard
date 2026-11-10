@@ -70,7 +70,7 @@ A call to a tool the guard hasn't seen in a list yet is refused `unknown_tool`, 
 | `catalog` | Advanced: tool catalog expiry | object | | See [`catalog`](#catalog). |
 | `limits` | Advanced: size limits | object | | See [`limits`](#limits). |
 
-Tool names are compared exactly: case-sensitive, no Unicode normalisation. All configuration refers to the names the **upstream** server uses, before any MCP Tool Mapping rename.
+Tool names are compared exactly: case-sensitive, no Unicode normalisation. A name with a control character, an invisible formatting character (such as a zero-width space) or a line or paragraph separator is refused in calls (`invalid_params`, detail `name_characters`) and removed from lists, because a server may cut the name short at such a character or drop it. All configuration refers to the names the **upstream** server uses, before any MCP Tool Mapping rename.
 
 ### `grants[]`
 
@@ -226,7 +226,7 @@ The guard writes one JSON event per line through the gateway's runtime log. To s
 | `tool_definition_conflict` | warn | A list showed one tool name more than once with different classes; the highest applies to every entry. |
 | `annotations_contradictory` | info | A tool declares both `readOnlyHint: true` and `destructiveHint: true`: read, or destructive with `strictContradictions`. |
 | `annotations_malformed` | warn | A hint is not `true` or `false` (`field`); it is read as missing. |
-| `list_entry_invalid` | warn | Entries of a list weren't a tool the guard can read, such as an entry without a string `name` or with one over `maxToolNameBytes` (`count`); they are removed from filtered lists and never learned. |
+| `list_entry_invalid` | warn | Entries of a list weren't a tool the guard can read, such as an entry without a string `name`, with one over `maxToolNameBytes`, or with one that has a control or invisible character (`count`); they are removed from filtered lists and never learned. |
 | `catalog_stale` / `catalog_fresh` | warn / info | The guard stopped trusting what it learned / inspected a list again. Each tool is trusted again once a list shows it. |
 | `request_rejected` | warn | A protocol error was returned. |
 | `pin_capacity_exhausted` | warn | A limit was reached (`limit`: `maxCachedTools`, `maxCatalogBytes` or `maxCatalogs`); the tools concerned stay unknown. |

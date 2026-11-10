@@ -80,6 +80,7 @@ Some integration tests are opt-in because they need extra setup or measure timin
 | `sse_server_request_first` | An SSE list whose server first sends a request to the client stalls (needs Node; see the file header) |
 | `interrupted_lists` | A list the gateway cuts off (upstream reset, timeout) or the client hangs up on makes the guard stop trusting the catalog, and a later page trusts only its own tools again (needs Docker Desktop; see the file header) |
 | `passthrough` | Requests forwarded without a body check carry nothing unchecked: no WebSocket upgrade, no HTTP/2 body (needs Docker Desktop and curl; see the file header) |
+| `js_server_ids` | In front of a JavaScript server, which rounds integer IDs beyond ±9007199254740991, requests with such IDs are refused and lists stay filtered (needs Node and Docker Desktop; see the file header) |
 
 ### Publishing
 
